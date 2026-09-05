@@ -1,0 +1,9 @@
+home,away,book,market,side,line,price
+PHI,DAL,pinnacle,spreads,home,-7,-105
+PHI,DAL,pinnacle,spreads,away,7,-105
+PHI,DAL,pinnacle,totals,over,47.5,-104
+PHI,DAL,pinnacle,totals,under,47.5,-106
+PHI,DAL,pinnacle,ml,home,,-330
+PHI,DAL,pinnacle,ml,away,,270
+PHI,DAL,fanduel,totals,under,48.5,-110
+PHI,DAL,fanduel,totals,over,48.5,-110

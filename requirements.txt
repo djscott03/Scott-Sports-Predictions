@@ -1,0 +1,8 @@
+pandas
+numpy
+scipy
+pyarrow
+requests
+streamlit
+streamlit-autorefresh
+tzdata

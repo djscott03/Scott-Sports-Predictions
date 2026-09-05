@@ -1,0 +1,10 @@
+.streamlit/secrets.toml
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+*.zip
+# scratch outputs from run.py; the frozen, graded record lives in predictions/
+*.csv
+!lines_template.csv
+!predictions/**/*.csv
