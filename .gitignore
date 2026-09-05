@@ -7,4 +7,5 @@ __pycache__/
 # scratch outputs from run.py; the frozen, graded record lives in predictions/
 *.csv
 !lines_template.csv
+!props_template.csv
 !predictions/**/*.csv

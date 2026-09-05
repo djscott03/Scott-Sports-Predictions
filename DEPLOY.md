@@ -33,6 +33,9 @@
   the $30/mo tier (20k requests) and set `REFRESH_MIN = "5"` for true near-real-time.
 - Community Cloud sleeps the app after ~12h without visitors and wakes on the next
   visit (~30s). That's fine for a personal board.
+- The **Props** tab is the exception to "1 request per refresh": each click bills
+  games × markets credits (the estimate is on the button, ≈24 with the defaults). It
+  never fetches on its own and keeps the last scan until you click again.
 
 ### Run it locally instead
 ```bash

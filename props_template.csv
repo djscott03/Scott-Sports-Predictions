@@ -1,0 +1,15 @@
+home,away,book,market,player,side,line,price
+PHI,DAL,draftkings,player_pass_yds,Jalen Hurts,over,274.5,-110
+PHI,DAL,draftkings,player_pass_yds,Jalen Hurts,under,274.5,-110
+PHI,DAL,fanduel,player_pass_yds,Jalen Hurts,over,264.5,-110
+PHI,DAL,fanduel,player_pass_yds,Jalen Hurts,under,264.5,-110
+PHI,DAL,draftkings,player_reception_yds,CeeDee Lamb,over,84.5,-110
+PHI,DAL,draftkings,player_reception_yds,CeeDee Lamb,under,84.5,-110
+PHI,DAL,fanduel,player_reception_yds,CeeDee Lamb,over,79.5,-114
+PHI,DAL,fanduel,player_reception_yds,CeeDee Lamb,under,79.5,-106
+PHI,DAL,draftkings,player_receptions,A.J. Brown,over,5.5,-115
+PHI,DAL,draftkings,player_receptions,A.J. Brown,under,5.5,-105
+PHI,DAL,fanduel,player_receptions,A.J. Brown,over,5.5,-120
+PHI,DAL,fanduel,player_receptions,A.J. Brown,under,5.5,100
+PHI,DAL,draftkings,player_anytime_td,Saquon Barkley,yes,,-175
+PHI,DAL,fanduel,player_anytime_td,Saquon Barkley,yes,,-160

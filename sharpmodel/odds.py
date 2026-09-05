@@ -13,6 +13,10 @@ Pipeline
 Why invert to mu instead of comparing prices directly: books post different
 numbers (-6.5 vs -7 vs -7.5). You can only compare a -7 (+100) against a
 -6.5 (-108) once both are probabilities from the same distribution.
+
+Player props live on a per-event endpoint that bills (markets x regions) per call, so
+fetch_events (free) -> estimate_prop_credits -> fetch_props (never automatic) -> long df
+with a `player` column. Pricing them is props.py's job; this file only ingests.
 """
 from __future__ import annotations
 import os
@@ -23,8 +27,17 @@ from .pricing import (LEAGUE_SD, devig, american_to_prob, decimal_from_american,
                       cover_probs, total_probs, edge_and_kelly)
 
 ODDS_API = "https://api.the-odds-api.com/v4/sports/{sport}/odds"
+EVENTS_API = "https://api.the-odds-api.com/v4/sports/{sport}/events"                 # free (0 credits)
+PROPS_API = "https://api.the-odds-api.com/v4/sports/{sport}/events/{event_id}/odds"  # markets x regions credits
 SPORT_KEY = {"nfl": "americanfootball_nfl", "cfb": "americanfootball_ncaaf"}
 SHARP_BOOKS = ["pinnacle", "circasports", "betonlineag", "bookmaker", "lowvig"]
+
+# Odds API player-prop market keys. Also exist (out of v1 scope): player_pass_attempts,
+# player_pass_completions, player_rush_attempts and *_alternate variants -- extend here.
+PROP_MARKETS_DEFAULT = ["player_pass_yds", "player_rush_yds", "player_reception_yds", "player_receptions"]
+PROP_MARKETS_ALL = PROP_MARKETS_DEFAULT + ["player_pass_tds", "player_anytime_td"]
+PROP_SIDES = {"over": "over", "under": "under", "yes": "yes", "no": "no"}
+PROP_COLS = ["event_id", "commence", "home", "away", "book", "market", "player", "side", "line", "price", "updated"]
 
 NFL_NAMES = {
     "Arizona Cardinals": "ARI", "Atlanta Falcons": "ATL", "Baltimore Ravens": "BAL", "Buffalo Bills": "BUF",
@@ -89,6 +102,98 @@ def load_odds_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
     if "event_id" not in df: df["event_id"] = df.home + "@" + df.away
     return df
+
+
+# ---------------- player props ----------------
+def fetch_events(league: str, api_key: str | None = None, known_teams: list[str] | None = None) -> pd.DataFrame:
+    """Upcoming events from the FREE endpoint (0 credits): event_id, commence (UTC), home, away."""
+    import requests
+    key = api_key or os.environ.get("ODDS_API_KEY")
+    if not key:
+        raise RuntimeError("Set ODDS_API_KEY (free tier at the-odds-api.com)")
+    r = requests.get(EVENTS_API.format(sport=SPORT_KEY[league]), params={"apiKey": key}, timeout=30)
+    r.raise_for_status()
+    rows = [dict(event_id=ev["id"], commence=ev["commence_time"],
+                 home=normalize_team(ev["home_team"], league, known_teams),
+                 away=normalize_team(ev["away_team"], league, known_teams)) for ev in r.json()]
+    df = pd.DataFrame(rows, columns=["event_id", "commence", "home", "away"])
+    df["commence"] = pd.to_datetime(df.commence, utc=True)
+    return df
+
+
+def estimate_prop_credits(n_events: int, markets, regions: str = "us") -> int:
+    """Upper bound on credits for fetch_props: each per-event call bills (markets returned x regions)."""
+    if isinstance(markets, str): markets = markets.split(",")
+    return int(n_events) * len(markets) * len(regions.split(","))
+
+
+def fetch_props(league: str, event_ids, markets=PROP_MARKETS_DEFAULT, regions: str = "us",
+                api_key: str | None = None, max_credits: int = 60, reserve: int = 50,
+                known_teams: list[str] | None = None) -> pd.DataFrame:
+    """
+    Player props for the given event_ids (from fetch_events), one per-event call each.
+    Quota-aware: refuses up front if the estimate exceeds max_credits, and stops early once
+    x-requests-remaining drops below `reserve`. Long format: PROP_COLS.
+    """
+    import requests
+    key = api_key or os.environ.get("ODDS_API_KEY")
+    if not key:
+        raise RuntimeError("Set ODDS_API_KEY (free tier at the-odds-api.com)")
+    event_ids, markets = list(event_ids), list(markets)
+    n_reg = len(regions.split(","))
+    cost = estimate_prop_credits(len(event_ids), markets, regions)
+    if cost > max_credits:
+        raise RuntimeError(
+            f"[props] {len(event_ids)} events x {len(markets)} markets x {n_reg} region(s) = {cost} credits "
+            f"> max_credits={max_credits}. Drop to <= {max_credits // (len(markets) * n_reg)} events, "
+            f"or <= {max_credits // (len(event_ids) * n_reg)} markets, or raise max_credits.")
+    frames = []
+    for eid in event_ids:
+        r = requests.get(PROPS_API.format(sport=SPORT_KEY[league], event_id=eid),
+                         params={"apiKey": key, "regions": regions, "markets": ",".join(markets),
+                                 "oddsFormat": "american"}, timeout=30)
+        r.raise_for_status()
+        ev = r.json()
+        frames.append(parse_props_json(ev, league, known_teams))
+        last, rem = r.headers.get("x-requests-last"), r.headers.get("x-requests-remaining")
+        print(f"[props] {normalize_team(ev['away_team'], league, known_teams)}@"
+              f"{normalize_team(ev['home_team'], league, known_teams)}: cost {last}, remaining {rem}")
+        if rem is not None and float(rem) < reserve:
+            print(f"[props] WARNING: {rem} credits left < reserve={reserve}; stopping after "
+                  f"{len(frames)}/{len(event_ids)} events")
+            break
+    frames = [f for f in frames if len(f)]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=PROP_COLS)
+
+
+def parse_props_json(event: dict, league: str, known_teams=None) -> pd.DataFrame:
+    """One per-event response -> long rows (PROP_COLS). Yes/No markets (anytime TD) carry no line."""
+    home = normalize_team(event["home_team"], league, known_teams)
+    away = normalize_team(event["away_team"], league, known_teams)
+    rows = []
+    for bk in event.get("bookmakers") or []:
+        for mk in bk.get("markets") or []:
+            for o in mk.get("outcomes") or []:
+                player, side = o.get("description"), PROP_SIDES.get(str(o.get("name", "")).lower())
+                if not player or side is None: continue
+                rows.append(dict(event_id=event["id"], commence=event.get("commence_time"), home=home, away=away,
+                                 book=bk["key"], market=mk["key"], player=player, side=side,
+                                 line=o.get("point", np.nan), price=o["price"], updated=mk.get("last_update")))
+    return pd.DataFrame(rows, columns=PROP_COLS)
+
+
+def load_props_csv(path: str) -> pd.DataFrame:
+    """Same long schema, for props you capture by hand (see props_template.csv).
+    Required columns: home, away, book, market, player, side(over|under|yes|no), line, price"""
+    df = pd.read_csv(path)
+    need = ["home", "away", "book", "market", "player", "side", "line", "price"]
+    missing = [c for c in need if c not in df]
+    if missing: raise ValueError(f"props csv missing columns: {missing}")
+    df["side"] = df.side.str.lower()
+    if "event_id" not in df: df["event_id"] = df.home + "@" + df.away
+    for c in ("commence", "updated"):
+        if c not in df: df[c] = np.nan
+    return df[PROP_COLS]
 
 
 # ---------------- fair pricing ----------------

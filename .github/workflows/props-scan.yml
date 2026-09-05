@@ -1,0 +1,65 @@
+# Player-prop scan on GitHub's runner. MANUAL ONLY -- never add a schedule: every run
+# bills (games x markets) credits from the free 500/month Odds API tier (needs the
+# ODDS_API_KEY repo secret). The board lands in the run's job summary and the CSVs
+# as a downloadable artifact; nothing is committed.
+name: props scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "season, e.g. 2026"
+        required: true
+      week:
+        description: "week number"
+        required: true
+      markets:
+        description: "comma-separated Odds API prop markets"
+        default: "player_pass_yds,player_rush_yds,player_reception_yds,player_receptions"
+      hours:
+        description: "only games kicking off within this many hours"
+        default: "72"
+      credits:
+        description: "refuse the scan if the estimate (games x markets) exceeds this"
+        default: "40"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: scan props
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          python run.py nfl props ${{ inputs.season }} ${{ inputs.week }} \
+            --markets ${{ inputs.markets }} --hours ${{ inputs.hours }} --credits ${{ inputs.credits }}
+      - name: job summary
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import pandas as pd
+          d = pd.read_csv("props_nfl_${{ inputs.season }}_w${{ inputs.week }}.csv").head(25)
+          cols = ["matchup", "market", "player", "side", "line", "price", "book", "n_books", "market_mu",
+                  "proj_mean", "fair_mu", "fair_price", "ev_pct", "kelly_stake", "flags"]
+          print(f"## props scan ${{ inputs.season }} w${{ inputs.week }} — top {len(d)} by EV\n")
+          if len(d):
+              d = d[cols].round(3).fillna("")
+              print("| " + " | ".join(cols) + " |"); print("|" + "---|" * len(cols))
+              for r in d.itertuples(index=False): print("| " + " | ".join(str(v) for v in r) + " |")
+          else:
+              print("no props above the +3% EV threshold")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: props-nfl-${{ inputs.season }}-w${{ inputs.week }}
+          path: |
+            props_*.csv
+            !props_template.csv
