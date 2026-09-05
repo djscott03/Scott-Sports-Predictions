@@ -116,8 +116,10 @@ def grade(league: str, hist: pd.DataFrame) -> pd.DataFrame:
     """Join every published week against final scores; return per-week ATS record + ROI."""
     rows = []
     res = hist[["game_id", "margin", "home_pts", "away_pts"]].dropna()
+    res = res.assign(game_id=res.game_id.astype(str))
     for path in sorted(glob.glob(f"{OUT}/{league}/*_w*.csv")):
-        pred = pd.read_csv(path)
+        # CFBD ids are numeric, so a CSV round-trip turns them into ints; join on str both sides
+        pred = pd.read_csv(path, dtype={"game_id": str})
         season, wk = os.path.basename(path)[:-4].split("_w")
         g = pred.merge(res, on="game_id", how="inner", suffixes=("_pred", ""))
         row = dict(season=int(season), week=int(wk), games=len(pred), graded=len(g))

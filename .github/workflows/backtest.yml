@@ -1,0 +1,42 @@
+# Walk-forward backtest on GitHub's runner (useful for CFB, whose data needs the
+# CFBD_API_KEY repo secret). Manual only. Results land in the run's job summary.
+name: backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      league:
+        description: "nfl or cfb"
+        default: "cfb"
+      start:
+        description: "first season to evaluate"
+        default: "2021"
+      end:
+        description: "last season to evaluate"
+        default: "2025"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: run backtest
+        env:
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+        run: |
+          python run.py ${{ inputs.league }} backtest ${{ inputs.start }} ${{ inputs.end }} | tee backtest.txt
+          {
+            echo "## ${{ inputs.league }} backtest ${{ inputs.start }}-${{ inputs.end }}"
+            echo '```json'
+            sed -n '/^{/,/^}/p' backtest.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ inputs.league }}-${{ inputs.start }}-${{ inputs.end }}
+          path: backtest_*.csv
