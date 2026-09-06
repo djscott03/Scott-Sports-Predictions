@@ -5,7 +5,9 @@ Usage:
   python run.py cfb predict 2026 2              # needs CFBD_API_KEY
   python run.py nfl ev 2026 1                   # scan every book for +EV lines + cross-book arbs/middles (needs ODDS_API_KEY)
   python run.py nfl ev 2026 1 --csv lines.csv   # ...or from lines you captured yourself
-  python run.py nfl ev 2026 1 --nomodel         # pure sharp-book devig, no model blend
+  python run.py nfl ev 2026 1 --nomodel         # pure sharp-book devig, no model blend (same as --weight 0)
+  python run.py nfl ev 2026 1 --hours 168 --exclude nonus   # only games inside 7 days; no EU/exchange books as legs
+                                                # (--exclude also takes a comma list of book keys; 'nonus' = odds.NON_US_BOOKS)
   python run.py nfl props 2026 1                # player props: free events list -> credit estimate -> per-event fetch
   python run.py nfl props 2026 1 --markets player_pass_yds,player_anytime_td --hours 48 --credits 30
   python run.py nfl props 2026 1 --csv props_template.csv   # ...or props you captured yourself (0 credits)
@@ -21,10 +23,28 @@ from sharpmodel.middles import find_middles, game_fairs, prop_fairs
 
 pd.set_option("display.width", 200); pd.set_option("display.max_columns", 40)
 
-OPTS = ("--csv", "--markets", "--hours", "--credits", "--weight")   # flags that take a value (not a season/week)
+OPTS = ("--csv", "--markets", "--hours", "--credits", "--weight", "--exclude")   # flags that take a value
 opt = lambda flag, default=None: sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 MID_COLS = ["type", "matchup", "market", "player", "bet_a", "bet_b", "window", "p_middle", "miss_cost_pct",
-            "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p"]
+            "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "n_alt", "alt"]
+
+
+def excluded_books():
+    """--exclude a,b,c | nonus (odds.NON_US_BOOKS) | nonus,extra_book"""
+    from sharpmodel.odds import NON_US_BOOKS
+    out = []
+    for b in (opt("--exclude", "") or "").split(","):
+        b = b.strip()
+        if b == "nonus": out += NON_US_BOOKS
+        elif b: out.append(b)
+    return out
+
+
+def within_hours(odds, hours):
+    """Keep lines whose game kicks off within `hours` (rows without a kickoff, e.g. a hand CSV, are kept)."""
+    if "commence" not in odds or not odds.commence.notna().any(): return odds
+    c, now = pd.to_datetime(odds.commence, utc=True, errors="coerce"), pd.Timestamp.now(tz="UTC")
+    return odds[c.isna() | ((c > now) & (c <= now + pd.Timedelta(hours=hours)))]
 
 
 def print_middles(mids, title, n=30):
@@ -71,23 +91,31 @@ elif mode == "predict":
 
 elif mode == "ev":
     season, week = args
-    csv = opt("--csv")
+    csv, hours, excl = opt("--csv"), float(opt("--hours", 168)), excluded_books()
+    weight = 0.0 if "--nomodel" in sys.argv else float(opt("--weight", 0.25))
+    if not 0 <= weight <= 1: sys.exit("ev: --weight must be between 0 and 1")
     model_fair = None
     known = None
     if league == "cfb":
         hist = load_cfb([season - 1, season]); known = sorted(set(hist.home) | set(hist.away))
-    if "--nomodel" not in sys.argv:
+    if weight > 0:
         hist = load_nfl([season - 1, season], with_epa=epa) if league == "nfl" else hist
         wp = SharpModel(league).predict_week(hist, season, week)
         model_fair = wp.preds[["home", "away", "model_margin", "model_total"]]
     odds = load_odds_csv(csv) if csv else fetch_odds(league, known_teams=known)
     odds.to_csv(f"odds_{league}_{season}_w{week}.csv", index=False)
-    print(f"{odds.event_id.nunique()} games, {odds.book.nunique()} books, {len(odds)} prices")
-    ev = find_ev(odds, league, model_fair=model_fair, model_weight=0.25, min_ev=0.015)
+    n_all = odds.event_id.nunique()
+    odds = within_hours(odds, hours)                                             # the API returns the whole season
+    print(f"{odds.event_id.nunique()} games kick off within {hours:.0f}h (of {n_all} posted), "
+          f"{odds.book.nunique()} books, {len(odds)} prices"
+          + (f"; {len(excl)} books excluded as legs" if excl else "")
+          + (f"; fair = {1 - weight:.0%} sharp book / {weight:.0%} model" if weight > 0 else "; fair = sharp book only"))
+    ev = find_ev(odds, league, model_fair=model_fair, model_weight=weight, min_ev=0.015)
+    if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)
     cols = ["matchup", "market", "team", "line", "price", "book", "ref_book", "fair_price", "p_win", "ev_pct", "kelly_stake"]
     print("\n=== +EV LINES (vs sharp-book fair, sorted by EV) ===")
     print(ev[cols].round(3).to_string(index=False) if len(ev) else "none above threshold")
-    mids = find_middles(odds, game_fairs(odds, league, model_fair, 0.25), league)
+    mids = find_middles(odds, game_fairs(odds, league, model_fair, weight), league, exclude=excl)
     print_middles(mids, "ARBS & MIDDLES")
     ev.to_csv(f"ev_{league}_{season}_w{week}.csv", index=False)
     best_lines(odds).to_csv(f"bestlines_{league}_{season}_w{week}.csv", index=False)
@@ -99,7 +127,7 @@ elif mode == "props":
     from sharpmodel.props import load_player_weeks, project_players, fit_dispersion, price_props
     if league != "nfl": sys.exit("props: NFL only (projections come from nflverse player stats)")
     season, week = args
-    csv, weight = opt("--csv"), float(opt("--weight", 0.30))
+    csv, weight, excl = opt("--csv"), float(opt("--weight", 0.30)), excluded_books()
     hours, credits = float(opt("--hours", 72)), int(opt("--credits", 60))
     markets = [m.strip() for m in opt("--markets", ",".join(PROP_MARKETS_DEFAULT)).split(",") if m.strip()]
     bad = [m for m in markets if m not in PROP_MARKETS_ALL]
@@ -132,6 +160,7 @@ elif mode == "props":
         fit_dispersion(stats, as_of=(season, week))                           # walk-forward cv per yardage market
         projections = project_players(stats, hist, as_of=(season, week))     # full hist -> env_factor gets team ppg
     ev = price_props(odds, projections, model_weight=weight, min_ev=0.03)
+    if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)   # consensus still used every book
     cols = ["matchup", "market", "player", "side", "line", "price", "book", "n_books", "market_mu", "proj_mean",
             "fair_mu", "fair_price", "ev_pct", "kelly_stake", "flags"]
     blend = f", {1 - weight:.0%}/{weight:.0%} market/projection" if projections is not None else ""
@@ -141,6 +170,6 @@ elif mode == "props":
                       "and are never staked; 'team_mismatch' rows are shown but staked 0.")
     (ev if len(ev) else pd.DataFrame(columns=cols)).to_csv(f"props_{league}_{season}_w{week}.csv", index=False)
     full = price_props(odds, projections, model_weight=weight, min_ev=-1.0)       # every two-way market -> fairs
-    mids = find_middles(odds, prop_fairs(full), league)
+    mids = find_middles(odds, prop_fairs(full), league, exclude=excl)
     print_middles(mids, "PROP ARBS & MIDDLES")
     mids.to_csv(f"props_middles_{league}_{season}_w{week}.csv", index=False)

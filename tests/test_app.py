@@ -73,7 +73,15 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     at = _run(monkeypatch, "k")
     assert any("Model unavailable" in i.value for i in at.info)
     tab = at.tabs[1]
-    assert tab.label == "Arbs & middles" and len(tab.dataframe) == 1
+    # sidebar default 'nonus': pinnacle still anchors the fair but cannot be a leg -> nothing to show
+    assert tab.label == "Arbs & middles" and len(tab.dataframe) == 0
+    assert any("No cross-book arbs" in s.value for s in tab.success) and at.metric[3].value == "0"
+    box = [t for t in at.text_input if t.label.startswith("Exclude books")][0]
+    assert box.value == "nonus"
+    box.set_value("").run()                                            # allow every book as a leg
+    assert not at.exception, at.exception
+    tab = at.tabs[1]
+    assert len(tab.dataframe) == 1
     view = tab.dataframe[0].value
     assert list(view["leg A"]) == ["PHI -2.5 -110 @ pinnacle"] and list(view["leg B"]) == ["DAL +3.5 -110 @ fanduel"]
     assert list(view["window"]) == ["3"] and list(view["type"]) == ["middle"] and "player" not in view.columns

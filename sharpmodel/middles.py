@@ -36,8 +36,9 @@ DISTS = ("nfl_margin", "normal", "poisson", "bernoulli")
 FAIR_COLS = ["event_id", "market", "player", "mu", "sd", "dist"]
 COLS = ["commence", "matchup", "market", "player", "type", "bet_a", "bet_b", "window", "p_middle",
         "miss_cost_pct", "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p",
-        "stake_a_pct", "stake_b_pct", "same_book",
+        "stake_a_pct", "stake_b_pct", "same_book", "n_alt", "alt",
         "event_id", "book_a", "line_a", "price_a", "book_b", "line_b", "price_b"]      # machine columns last
+_ROW_COLS = [c for c in COLS if c not in ("n_alt", "alt")]                          # filled in by _collapse
 SIDE_A = {"home", "over", "yes"}          # side A wins when the number goes UP
 SIDE_B = {"away", "under", "no"}          # side B wins when it goes DOWN
 TYPES = ("arb", "arb+middle", "free_middle", "middle", "half_middle")
@@ -163,10 +164,34 @@ def _window_str(w: np.ndarray, suffix: str = "") -> str:
 
 
 # ---------------- the finder ----------------
+def _collapse(res: pd.DataFrame) -> pd.DataFrame:
+    """One row per pair of NUMBERS (event, market, player, line_a, line_b): the best-EV pairing of books, with the
+    other pairings at the same numbers folded into n_alt / alt ("B betus +167; B bovada +165"). One stale price
+    against 28 books is one opportunity, not 28 rows."""
+    res = res.assign(_pk=res.player.fillna("")).sort_values("ev_pct", ascending=False, kind="stable")
+    am = lambda p: f"{int(round(float(p))):+d}"
+    keep, n_alt, alt = [], [], []
+    for _, g in res.groupby(["event_id", "market", "_pk", "line_a", "line_b"], dropna=False, sort=False):
+        best, others = g.iloc[0], g.iloc[1:]
+        desc = []
+        for r in others.itertuples():
+            if r.book_a != best.book_a: desc.append(f"A {r.book_a} {am(r.price_a)}")
+            if r.book_b != best.book_b: desc.append(f"B {r.book_b} {am(r.price_b)}")
+        desc = list(dict.fromkeys(desc))                                           # dedupe, keep EV order
+        keep.append(best.name); n_alt.append(len(others))
+        alt.append("; ".join(desc[:4]) + (" ..." if len(desc) > 4 else ""))
+    out = res.loc[keep].drop(columns="_pk")
+    out["n_alt"], out["alt"] = n_alt, alt
+    return out
+
+
 def find_middles(odds: pd.DataFrame, fairs: pd.DataFrame, league: str = "nfl", min_ev: float = 0.0,
-                 include_same_book: bool = False) -> pd.DataFrame:
+                 include_same_book: bool = False, exclude=None, collapse: bool = True) -> pd.DataFrame:
     """
     Every cross-book pair of opposite sides on one market, priced as a middle/arb off `fairs`.
+    exclude: books that may not be a LEG (they still shape `fairs`, which the caller builds from the full board) --
+             e.g. odds.NON_US_BOOKS for a US bettor. collapse: keep one row per pair of numbers (the best pairing),
+             folding the other book combinations into n_alt / alt; False lists every pairing.
     odds: long schema (event_id, commence, home, away, book, market, side, line, price [, player]).
     fairs: FAIR_COLS -- one row per (event_id, market[, player]) with mu, sd, dist in DISTS; see
            game_fairs / prop_fairs. Markets without a fair are skipped.
@@ -194,6 +219,7 @@ def find_middles(odds: pd.DataFrame, fairs: pd.DataFrame, league: str = "nfl", m
     o["price"] = pd.to_numeric(o.price, errors="coerce").astype(float)   # stable dtype whether or not a blank is dropped
     o["_dec"] = o.price.map(decimal_from_american)
     o = o[o._dec.notna()]                                        # a blank price cannot be the best price
+    if exclude is not None and len(exclude): o = o[~o.book.isin(set(exclude))]
     rows = []
     for (eid, mk, pk), e in o.groupby(["event_id", "market", "_pkey"]):
         fair = fk.get((eid, mk, pk))
@@ -230,8 +256,10 @@ def find_middles(odds: pd.DataFrame, fairs: pd.DataFrame, league: str = "nfl", m
                     stake_a_pct=100 * r["stake_a"], stake_b_pct=100 * r["stake_b"], same_book=same,
                     event_id=eid, book_a=a.book, line_a=a.line, price_a=a.price,
                     book_b=b.book, line_b=b.line, price_b=b.price))
-    res = pd.DataFrame(rows, columns=COLS)
-    if res.empty: return res
+    res = pd.DataFrame(rows, columns=_ROW_COLS)
+    if res.empty: return pd.DataFrame(columns=COLS)
+    res = _collapse(res) if collapse else res.assign(n_alt=0, alt="")
+    res = res[COLS]
     res = res[(res.guaranteed_pct >= -EPS) | (res.ev_pct >= min_ev)]
     safe = res.guaranteed_pct >= -EPS                                    # cannot lose: arbs, free (half) middles
     res = res.assign(_o=np.where(safe, 0, 1), _k=np.where(safe, res.guaranteed_pct, res.ev_pct))

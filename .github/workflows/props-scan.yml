@@ -22,6 +22,12 @@ on:
       credits:
         description: "refuse the scan if the estimate (games x markets) exceeds this"
         default: "40"
+      weight:
+        description: "projection blend weight; 0 = devigged market consensus only (stale lines + middles), 0.30 = the CLI default"
+        default: "0"
+      exclude:
+        description: "books that may not be a +EV row or a middle leg: 'nonus' = EU/UK/AU/exchange keys + pinnacle, or a comma list"
+        default: "nonus"
 
 permissions:
   contents: read
@@ -45,9 +51,11 @@ jobs:
           MARKETS: ${{ inputs.markets }}
           HOURS: ${{ inputs.hours }}
           CREDITS: ${{ inputs.credits }}
+          WEIGHT: ${{ inputs.weight }}
+          EXCLUDE: ${{ inputs.exclude }}
         run: |
           python run.py nfl props "$SEASON" "$WEEK" \
-            --markets "$MARKETS" --hours "$HOURS" --credits "$CREDITS"
+            --markets "$MARKETS" --hours "$HOURS" --credits "$CREDITS" --weight "$WEIGHT" --exclude "$EXCLUDE"
       - name: job summary
         env:
           SEASON: ${{ inputs.season }}
@@ -57,16 +65,27 @@ jobs:
           import os
           import pandas as pd
           season, week = os.environ["SEASON"].strip(), os.environ["WEEK"].strip()
-          d = pd.read_csv(f"props_nfl_{season}_w{week}.csv").head(25)
-          cols = ["matchup", "market", "player", "side", "line", "price", "book", "n_books", "market_mu",
-                  "proj_mean", "fair_mu", "fair_price", "ev_pct", "kelly_stake", "flags"]
-          print(f"## props scan {season} w{week} — top {len(d)} by EV\n")
-          if len(d):
-              d = d[cols].round(3).fillna("")
-              print("| " + " | ".join(cols) + " |"); print("|" + "---|" * len(cols))
+          def load(path):
+              try: return pd.read_csv(path)
+              except (FileNotFoundError, pd.errors.EmptyDataError): return pd.DataFrame()
+          def table(d, cols, n=25):
+              d = d[[c for c in cols if c in d]].head(n).round(3).fillna("")
+              print("| " + " | ".join(d.columns) + " |"); print("|" + "---|" * len(d.columns))
               for r in d.itertuples(index=False): print("| " + " | ".join(str(v) for v in r) + " |")
+          d = load(f"props_nfl_{season}_w{week}.csv")
+          print(f"## props scan {season} w{week} — top {min(len(d), 25)} of {len(d)} by EV\n")
+          if len(d):
+              table(d, ["matchup", "market", "player", "side", "line", "price", "book", "n_books", "market_mu",
+                        "proj_mean", "fair_mu", "fair_price", "ev_pct", "kelly_stake", "flags"])
           else:
               print("no props above the +3% EV threshold")
+          m = load(f"props_middles_nfl_{season}_w{week}.csv")
+          print(f"\n## prop arbs & middles — top {min(len(m), 25)} of {len(m)} (% of the total stake)\n")
+          if len(m):
+              table(m, ["type", "matchup", "market", "player", "bet_a", "bet_b", "window", "p_middle",
+                        "miss_cost_pct", "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "alt"])
+          else:
+              print("no cross-book prop arbs or +EV middles")
           EOF
       - uses: actions/upload-artifact@v4
         with:

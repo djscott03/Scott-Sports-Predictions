@@ -31,6 +31,15 @@ EVENTS_API = "https://api.the-odds-api.com/v4/sports/{sport}/events"            
 PROPS_API = "https://api.the-odds-api.com/v4/sports/{sport}/events/{event_id}/odds"  # markets x regions credits
 SPORT_KEY = {"nfl": "americanfootball_nfl", "cfb": "americanfootball_ncaaf"}
 SHARP_BOOKS = ["pinnacle", "circasports", "betonlineag", "bookmaker", "lowvig"]
+# Books a US bettor cannot get down at (EU/UK/AU region keys, exchanges, Pinnacle). They still anchor the fair
+# number; `--exclude nonus` keeps them out of the +EV rows and the arb/middle legs.
+NON_US_BOOKS = ["pinnacle", "marathonbet", "matchbook", "smarkets", "betfair_ex_eu", "betfair_ex_uk", "betfair_ex_au",
+                "unibet_eu", "unibet_nl", "unibet_se", "unibet_uk", "unibet", "leovegas", "leovegas_se", "pmu_fr",
+                "coolbet", "tipico_de", "onexbet", "williamhill", "betsson", "nordicbet", "suprabets", "winamax_fr",
+                "winamax_de", "betclic_fr", "parionssport_fr", "sport888", "mrgreen", "paddypower", "skybet",
+                "ladbrokes_uk", "ladbrokes_au", "coral", "betvictor", "boylesports", "grosvenor", "virginbet",
+                "livescorebet", "casumo", "betway", "sportsbet", "tab", "neds", "playup", "pointsbetau", "betr_au",
+                "bluebet", "topsport", "gtbets", "everygame"]
 
 # Odds API player-prop market keys. Also exist (out of v1 scope): player_pass_attempts,
 # player_pass_completions, player_rush_attempts and *_alternate variants -- extend here.

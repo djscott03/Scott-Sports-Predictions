@@ -45,7 +45,13 @@ week = st.sidebar.number_input("Week", 1, 22, 1)
 min_ev = st.sidebar.slider("Min EV %", 0.0, 8.0, 1.5, 0.5) / 100
 model_w = st.sidebar.slider("Model blend weight", 0.0, 0.6, 0.25, 0.05)
 markets = st.sidebar.multiselect("Markets", ["spreads", "totals", "ml"], ["spreads", "totals", "ml"])
-books_excl = st.sidebar.text_input("Exclude books (comma sep)", "")
+books_excl = st.sidebar.text_input("Exclude books (comma sep)", "nonus",
+                                   help="Books you cannot bet at are dropped as +EV rows and as arb/middle legs but still "
+                                        "anchor the fair numbers. 'nonus' = every EU/UK/AU/exchange key + pinnacle.")
+excl = [b.strip() for b in books_excl.split(",") if b.strip()]
+if "nonus" in excl:
+    from sharpmodel.odds import NON_US_BOOKS
+    excl = [b for b in excl if b != "nonus"] + NON_US_BOOKS
 auto = st.sidebar.toggle("Auto-refresh", True)
 if st.sidebar.button("Force refresh now"):
     st.cache_data.clear()
@@ -92,10 +98,11 @@ def kickoff(s):
 
 NO_KEY = "No odds loaded. Add ODDS_API_KEY in Streamlit secrets (free at the-odds-api.com)."
 MID_COLS = ["commence", "matchup", "market", "player", "type", "bet_a", "bet_b", "window", "p_middle", "miss_cost_pct",
-            "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "stake_a_pct", "stake_b_pct"]
+            "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "stake_a_pct", "stake_b_pct", "alt"]
 MID_NAMES = {"bet_a": "leg A", "bet_b": "leg B", "p_middle": "middle %", "miss_cost_pct": "miss cost %",
              "win_both_pct": "win both %", "ev_pct": "EV %", "guaranteed_pct": "guaranteed %",
-             "breakeven_p": "breakeven %", "stake_a_pct": "stake A %", "stake_b_pct": "stake B %"}
+             "breakeven_p": "breakeven %", "stake_a_pct": "stake A %", "stake_b_pct": "stake B %",
+             "alt": "same numbers also at"}
 MID_NOTE = ("Two legs at two books, stakes split so a miss (the sides split) costs the same either way; every % is of "
             "the total stake. The middle lands when the number finishes inside the window and both legs cash "
             "(win both %); miss cost % is what a miss loses; breakeven % is the middle probability that covers it and "
@@ -121,8 +128,7 @@ st.title(f"{league.upper()} +EV board")
 if odds.empty:
     st.warning(NO_KEY)
 else:
-    excl = [b.strip() for b in books_excl.split(",") if b.strip()]
-    odds = odds[odds.market.isin(markets) & ~odds.book.isin(excl)]
+    odds = odds[odds.market.isin(markets)]                         # excluded books still anchor the fair numbers
     try:
         preds, ratings, mkt_ratings = model_card(league, season, week)
         model_fair = preds[["home", "away", "model_margin", "model_total"]]
@@ -131,7 +137,8 @@ else:
         st.info(f"Model unavailable ({e}); showing pure market-vs-market EV.")
 
     ev = find_ev(odds, league, model_fair=model_fair, model_weight=model_w, min_ev=min_ev)
-    mids = find_middles(odds, game_fairs(odds, league, model_fair, model_w), league)
+    if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)
+    mids = find_middles(odds, game_fairs(odds, league, model_fair, model_w), league, exclude=excl)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Games", odds.event_id.nunique())
@@ -233,7 +240,7 @@ with tab5:
                     note = f"Projections unavailable ({e}); pricing market-only."
                 board = dict(ev=price_props(po, proj, model_weight=model_w, min_ev=min_ev), key=key, note=note)
                 full = price_props(po, proj, model_weight=model_w, min_ev=-1.0)   # every two-way market -> fairs
-                board["mid"] = find_middles(po, prop_fairs(full), "nfl")
+                board["mid"] = find_middles(po, prop_fairs(full), "nfl", exclude=excl)
                 st.session_state["props"] = board
             if board["note"]: st.info(board["note"])
             pev = board["ev"]

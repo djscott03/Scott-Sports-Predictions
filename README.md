@@ -82,8 +82,18 @@ needed for NFL.
 export ODDS_API_KEY=...        # free tier at the-odds-api.com (500 req/mo; each scan = 1 request)
 python run.py nfl ev 2026 1                 # every US/EU book, spreads + totals + ML
 python run.py nfl ev 2026 1 --csv lines.csv # lines you captured yourself (see lines_template.csv)
-python run.py nfl ev 2026 1 --nomodel       # pure market-vs-market, no model blend
+python run.py nfl ev 2026 1 --nomodel       # pure market-vs-market, no model blend (= --weight 0)
+python run.py nfl ev 2026 1 --hours 168 --exclude nonus   # games inside 7 days; no EU/exchange books as bets
 ```
+
+`--hours` matters because the API posts the whole season (272 games on the first live
+run) and far-future numbers are stale by nature. `--exclude nonus` drops every EU/UK/AU
+book, the exchanges and Pinnacle from the *bettable* rows and legs — a US bettor can't
+get down there — while they still anchor the fair numbers (`--exclude a,b` also takes a
+plain list; the dashboard sidebar has the same box). `--weight` is the model's share of
+the fair number: with 0.25 the first live board was mostly the *model* disagreeing with
+every book at once (Pinnacle included), which is not a stale line. The `ev scan` Action
+therefore defaults to `--weight 0`, i.e. sharp-book market vs. every other book.
 
 How it prices a line:
 1. Take the sharpest posted book (Pinnacle > Circa > BetOnline > Bookmaker; else median of all).
@@ -166,6 +176,17 @@ Caveats (this is where the money leaks):
   `p_middle` still carries projection error (see the props caveats).
 - Integer numbers push and NFL moneyline ties refund both legs; the outcome table handles both
   (a refund is never counted as a loss); the pmf gives a tie ~0.3% (reality ~0.2%).
+- One stale price against 28 books is one opportunity, not 28 rows: the table keeps the
+  best pairing per pair of numbers and folds the rest into `n_alt` / `alt`
+  (`B bovada +165; B betmgm +160 ...`) so you can see where else the same leg is available.
+- Books in `--exclude` (default `nonus` in the Actions and the dashboard) never appear as a
+  leg; they still shape the fair number the middle is priced on.
+
+First live run (2026-09-05, Week 1, market-only): 272 events / 35 books / 5,394 prices in one
+credit; the board surfaced a real 3-point middle (BAL −2.5 at one book, LAC +3.5 at another,
++3.0% EV) and a handful of moneyline arbs that were all one stale EU price — hence `nonus`.
+The props scan (2 games × 4 markets = 8 credits, cost per call verified against the
+`x-requests-last` header) found a receiving-yards middle with a 20–22 window.
 
 ## Player props (NFL, free tier)
 

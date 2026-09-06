@@ -31,15 +31,16 @@ sharpmodel/middles.py      cross-book arbs & middles: game_fairs (blended_fair -
 sharpmodel/props.py        nflverse weekly player stats -> project_players (EW usage x opp x env), fit_dispersion
                            (starters only), prop_probs / implied_mean (normal/poisson/bernoulli), price_props
                            (devigged consensus by normalised name, blend weight, rows carry event_id + dist + fair_sd)
-run.py                     CLI: backtest | predict | ev (+EV table, then ARBS & MIDDLES -> middles_*.csv) |
-                           props (--csv --markets --hours --credits --weight --nomodel; board, then PROP ARBS &
-                           MIDDLES -> props_middles_*.csv)
+run.py                     CLI: backtest | predict | ev (--csv --hours --exclude --weight/--nomodel; +EV table, then
+                           ARBS & MIDDLES -> middles_*.csv) | props (--csv --markets --hours --credits --weight
+                           --exclude --nomodel; board, then PROP ARBS & MIDDLES -> props_middles_*.csv);
+                           --exclude takes book keys or 'nonus' (odds.NON_US_BOOKS)
 holdout.py                 fit blend weight on early seasons, confirm on held-out ones
 publish_card.py            auto-detect week -> predictions/<league>/<season>_wNN.{md,csv} + graded README index
 app.py                     Streamlit dashboard (tabs: +EV, arbs & middles, best lines, model card, props
                            [button-gated; prop middles under the board])
 lines_template.csv         --csv schema for game lines;  props_template.csv  --csv schema for props (both tracked)
-tests/                     offline pytest (88 tests, ~7s; incl. AppTest smoke + subprocess runs of run.py ev/props);
+tests/                     offline pytest (89 tests, ~7s; incl. AppTest smoke + subprocess runs of run.py ev/props);
                            conftest chdir's to repo root
 .github/workflows/ci.yml           pytest on push/PR (python 3.12)
 .github/workflows/weekly-card.yml  cron Tue+Thu 13:00 UTC + manual dispatch; commits predictions/
@@ -98,11 +99,17 @@ tests/                     offline pytest (88 tests, ~7s; incl. AppTest smoke + 
   dropped; anything with `guaranteed_pct >= 0` (arbs, free middles) is always kept and sorted first.
   `ev_pct` is the exact sum over every outcome (pushes included); the `window` / `p_middle` /
   `win_both_pct` columns are the headline both-win numbers (a `half_middle` shows its push-win
-  number as `3p` and that outcome's payoff instead).
+  number as `3p` and that outcome's payoff instead). `find_middles(collapse=True)` (default)
+  keeps one row per pair of numbers — the best-EV pairing — with the other book combinations in
+  `n_alt` / `alt`; `exclude=` removes books as legs only (fairs are built by the caller from the
+  full board, on purpose).
+- **Actions scan market-only by default** (`weight` input 0, `exclude` input `nonus`); the CLI
+  keeps the documented 0.25 / 0.30 defaults. The live board with the model on was model-vs-market,
+  which is not what the scanner is for.
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
 
 ## Verified state (2026-09-05, local .venv on python 3.9; CI uses 3.12)
-- `python -m pytest -q tests` → 88 passed in ~7s (15 original + props projections/pricing,
+- `python -m pytest -q tests` → 89 passed in ~7s (15 original + props projections/pricing,
   prop ingestion + run.py subprocess runs, dashboard AppTest, publish grading, holdout,
   `tests/test_margins.py`, `tests/test_middles.py` incl. a subprocess run of run.py ev + props;
   the 2026-09-05 second review pass added 9: yes-only longshot bound, bad-body / transport-failure
@@ -137,9 +144,17 @@ tests/                     offline pytest (88 tests, ~7s; incl. AppTest smoke + 
 - `python publish_card.py` wrote `predictions/nfl/2026_w01.{md,csv}` (16 games, 3 plays).
 - Grading path verified by publishing a finished 2025 week and confirming W-L-P/units, then deleted.
 - `app.py` passes `streamlit.testing.v1.AppTest` with no key (shows the warning, no exceptions).
-- `fetch_odds` has NOT been hit against the live Odds API yet (no key). First real call:
-  sanity-check `parse_odds_json` field names against the v4 response (a unit test covers the
-  documented shape).
+- **Live Odds API verified 2026-09-05** via the `ev scan` and `props scan` Actions (secrets set
+  by the owner): `fetch_odds` -> 272 events / 35 books / 5,394 prices, 1 credit; `fetch_events`
+  + `fetch_props` on 2 games x 4 markets cost exactly 4 per call (`x-requests-last`), 483 credits
+  left afterwards. `parse_odds_json` / `parse_props_json` matched the real v4 shape. Findings that
+  drove the same-day changes: (1) with `--weight 0.25` the +EV board was the model disagreeing
+  with every book at once, so the Actions default to `--weight 0`; (2) one stale marathonbet ML
+  produced 28 "arbs" -> `find_middles` now collapses to the best pairing per pair of numbers
+  (`n_alt` / `alt`) and `--exclude nonus` (`odds.NON_US_BOOKS`) keeps EU/exchange books out of
+  the legs and +EV rows while they still anchor the fairs; (3) the API returns the whole season,
+  so `ev` has `--hours` (default 168). Real prop middle seen live: T. Ferguson rec yds O 19.5 /
+  U 22.5 (window 20-22, +1.1%).
 - Props: `python run.py nfl props 2026 1 --csv props_template.csv` runs end to end
   (nflverse stats 2024–2025 load in ~1s, 2026 404s and is skipped, 2 plays on the template's
   stale lines). Fitted cv as of 2026 w1 with the starters-only fit: pass 0.35 (floor) / rush 0.62 /

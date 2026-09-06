@@ -17,6 +17,15 @@ on:
       league:
         description: "nfl or cfb"
         default: "nfl"
+      hours:
+        description: "only games kicking off within this many hours (the API posts the whole season)"
+        default: "168"
+      exclude:
+        description: "books that may not be a leg / +EV row: 'nonus' = EU/UK/AU/exchange keys + pinnacle, or a comma list"
+        default: "nonus"
+      weight:
+        description: "model blend weight for the fair number; 0 = sharp-book market only (stale lines), 0.25 = the CLI default"
+        default: "0"
 
 permissions:
   contents: read
@@ -39,8 +48,11 @@ jobs:
           SEASON: ${{ inputs.season }}
           WEEK: ${{ inputs.week }}
           LEAGUE: ${{ inputs.league }}
+          HOURS: ${{ inputs.hours }}
+          EXCLUDE: ${{ inputs.exclude }}
+          WEIGHT: ${{ inputs.weight }}
         run: |
-          python run.py "$LEAGUE" ev "$SEASON" "$WEEK"
+          python run.py "$LEAGUE" ev "$SEASON" "$WEEK" --hours "$HOURS" --exclude "$EXCLUDE" --weight "$WEIGHT"
       - name: job summary
         env:
           SEASON: ${{ inputs.season }}
@@ -69,7 +81,7 @@ jobs:
           print(f"\n## arbs & middles — top {min(len(m), 25)} of {len(m)} (% of the total stake)\n")
           if len(m):
               table(m, ["type", "matchup", "market", "bet_a", "bet_b", "window", "p_middle", "miss_cost_pct",
-                        "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p"])
+                        "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "alt"])
           else:
               print("no cross-book arbs or +EV middles")
           EOF

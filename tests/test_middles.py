@@ -144,13 +144,38 @@ def test_best_price_per_book_and_ranking():
                  dict(book="A", market="totals", side="over", line=44.5, price=100),
                  dict(book="B", market="totals", side="under", line=46.5, price=100))
     m = find_middles(odds, FAIRS)
-    assert list(m.type) == ["arb", "free_middle", "middle", "middle"]            # cannot-lose first, then by EV
+    assert list(m.type) == ["arb", "free_middle", "middle"]                      # cannot-lose first, then by EV
     assert m.guaranteed_pct.iloc[0] > 0 and m.guaranteed_pct.iloc[1] == 0
-    assert m.ev_pct.iloc[2] > m.ev_pct.iloc[3] and m.iloc[2].bet_b == "DAL +3.5 +100 @ C"
-    assert "-105 @ A" in m.iloc[2].bet_a and not any("-115" in b for b in m.bet_a)
+    r = m.iloc[2]                                                                # -2.5 / +3.5: best pairing is A vs C
+    assert r.bet_b == "DAL +3.5 +100 @ C" and "-105 @ A" in r.bet_a and not any("-115" in b for b in m.bet_a)
+    assert r.n_alt == 1 and r.alt == "B B -110"                                  # the B pairing folded into alt
+    assert (m.n_alt.iloc[:2] == 0).all() and (m.alt.iloc[:2] == "").all()
+    every = find_middles(odds, FAIRS, collapse=False)                            # collapse=False lists every pairing
+    assert list(every.type) == ["arb", "free_middle", "middle", "middle"] and (every.n_alt == 0).all()
+    assert every.ev_pct.iloc[2] > every.ev_pct.iloc[3]
     high = find_middles(odds, FAIRS, min_ev=50)                                    # arbs / free middles survive any threshold
     assert list(high.type) == ["arb", "free_middle"]
     assert set(m.type) <= set(TYPES)
+
+
+def test_collapse_keeps_one_row_per_pair_of_numbers_and_exclude_drops_legs():
+    """One stale price against many books is one opportunity: the live scan showed the same marathonbet ML paired
+    with 28 books as 28 'arbs'. Excluded books cannot be a leg but still shape the fairs (built by the caller)."""
+    rows = [dict(book="stale", market="ml", side="home", line=np.nan, price=-159)]
+    rows += [dict(book=b, market="ml", side="away", line=np.nan, price=p)
+             for b, p in (("x", 170), ("y", 167), ("z", 165), ("w", 165), ("v", 160), ("u", 160))]
+    m = find_middles(_odds(*rows), FAIRS)
+    assert len(m) == 1 and m.iloc[0].type == "arb" and m.iloc[0].book_b == "x" and m.iloc[0].n_alt == 5
+    assert m.iloc[0].alt == "B y +167; B w +165; B z +165; B u +160 ..."          # EV order, ties by book key
+    ex = find_middles(_odds(*rows), FAIRS, exclude=["stale"])
+    assert ex.empty and list(ex.columns) == COLS
+    ex = find_middles(_odds(*rows), FAIRS, exclude=["x", "y"])
+    assert len(ex) == 1 and ex.iloc[0].book_b == "w" and ex.iloc[0].n_alt == 3          # +165 tie -> first book key
+    # a leg at a different NUMBER is a different row, not an alternative
+    two = find_middles(_odds(dict(book="A", market="spreads", side="home", line=-2.5, price=-110),
+                             dict(book="B", market="spreads", side="away", line=3.5, price=-110),
+                             dict(book="C", market="spreads", side="away", line=3.0, price=100)), FAIRS, min_ev=-100)
+    assert len(two) == 2 and (two.n_alt == 0).all()
 
 
 def test_non_unique_index_from_a_concat_is_reset():
@@ -162,11 +187,13 @@ def test_non_unique_index_from_a_concat_is_reset():
               dict(book="C", market="spreads", side="away", line=3.5, price=100))
     cat = pd.concat([a, b])                                                      # index 0, 1, 0, 1
     assert not cat.index.is_unique
-    clean = find_middles(pd.concat([a, b], ignore_index=True), FAIRS)
-    m = find_middles(cat, FAIRS)
+    clean = find_middles(pd.concat([a, b], ignore_index=True), FAIRS, collapse=False)
+    m = find_middles(cat, FAIRS, collapse=False)
     pd.testing.assert_frame_equal(m, clean)
     assert len(m) == 2 and all("-105 @ A" in x for x in m.bet_a) and set(m.bet_b) == {"DAL +3.5 -110 @ B", "DAL +3.5 +100 @ C"}
-    pd.testing.assert_frame_equal(find_middles(pd.concat([cat, cat]), FAIRS), clean)   # the same CSV loaded twice
+    pd.testing.assert_frame_equal(find_middles(pd.concat([cat, cat]), FAIRS, collapse=False), clean)   # the same CSV loaded twice
+    one = find_middles(cat, FAIRS)                                               # collapsed: one row, B folded in
+    assert len(one) == 1 and one.iloc[0].bet_b == "DAL +3.5 +100 @ C" and one.iloc[0].n_alt == 1
     assert cat.index.tolist() == [0, 1, 0, 1]                                    # the caller's frame is untouched
 
 
@@ -260,6 +287,14 @@ def test_run_ev_and_props_write_middles_csvs(tmp_path):                         
     assert "=== +EV LINES" in r.stdout and "=== ARBS & MIDDLES" in r.stdout and "O 47.5 -104 @ pinnacle" in r.stdout
     m = pd.read_csv(tmp_path / "middles_nfl_2026_w1.csv")
     assert list(m.columns) == COLS and len(m) == 1 and m.iloc[0].window == 48 and m.iloc[0].type == "middle"
+    # --exclude drops a leg's book (pinnacle is leg A of the only middle); --weight 0 == --nomodel; --hours keeps
+    # rows without a kickoff
+    r = _run("ev", ["--csv", os.path.join(ROOT, "lines_template.csv"), "--weight", "0", "--exclude", "nonus",
+                    "--hours", "1"], tmp_path)
+    assert r.returncode == 0, r.stderr
+    assert "books excluded as legs" in r.stdout and "fair = sharp book only" in r.stdout
+    assert "=== +EV LINES" in r.stdout and "@ pinnacle" not in r.stdout
+    assert pd.read_csv(tmp_path / "middles_nfl_2026_w1.csv").empty
     r = _run("props", ["--csv", os.path.join(ROOT, "props_template.csv"), "--nomodel"], tmp_path)
     assert r.returncode == 0, r.stderr
     assert "=== +EV PROPS" in r.stdout and "=== PROP ARBS & MIDDLES" in r.stdout
