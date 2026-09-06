@@ -418,8 +418,8 @@ def best_lines(odds: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------- top picks ----------------
-PICK_COLS = ["rank", "commence", "matchup", "market", "side", "team", "line", "price", "book", "also", "n_books",
-             "fair_price", "p_win", "ev_pct", "kelly_stake", "ref_book"]
+PICK_COLS = ["rank", "commence", "matchup", "market", "player", "side", "team", "line", "price", "book", "also",
+             "n_books", "fair_price", "p_win", "ev_pct", "kelly_stake", "ref_book", "flags"]
 
 
 def _am(p) -> str:
@@ -428,16 +428,18 @@ def _am(p) -> str:
 
 def top_picks(ev: pd.DataFrame, n: int = 10) -> pd.DataFrame:
     """
-    The +EV board deduped to ONE row per pick -- (matchup, market, side, line) -- at its best price, ranked by EV:
-    'CHI -3 +100' is one pick even when five books post it. `also` lists the other books on the same number, best
-    price first ('betus +100; betmgm -102'), n_books counts them all. Empty in -> empty out (PICK_COLS).
+    The +EV board deduped to ONE row per pick -- (matchup, market[, player], side, line) -- at its best price, ranked
+    by EV: 'CHI -3 +100' is one pick even when five books post it. Works on the props board too (player column).
+    `also` lists the other books on the same number, best price first ('betus +100; betmgm -102'), n_books counts
+    them all. Empty in -> empty out (PICK_COLS, only the columns present).
     """
     if ev is None or len(ev) == 0: return pd.DataFrame(columns=PICK_COLS)
     e = ev.copy()
     e["_dec"] = pd.to_numeric(e.price, errors="coerce").map(decimal_from_american)
     e = e.sort_values(["ev_pct", "_dec"], ascending=[False, False], kind="stable")
+    keys = ["matchup", "market"] + (["player"] if "player" in e else []) + ["side", "line"]
     rows = []
-    for _, g in e.groupby(["matchup", "market", "side", "line"], dropna=False, sort=False):
+    for _, g in e.groupby(keys, dropna=False, sort=False):
         d = g.iloc[0].to_dict()
         d["n_books"] = len(g)
         d["also"] = "; ".join(f"{r.book} {_am(r.price)}" for r in g.iloc[1:].itertuples())

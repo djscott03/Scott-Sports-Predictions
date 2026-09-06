@@ -42,6 +42,8 @@ ODDS_KEY = secret("ODDS_API_KEY")
 CFBD_KEY = secret("CFBD_API_KEY")
 REFRESH_MIN = int(secret("REFRESH_MIN", 20))
 DEMO_ODDS = secret("SHARPMODEL_DEMO_ODDS")
+PIN = secret("SCAN_PIN")                              # set before sharing the link: gates props scans + force refresh
+MAX_PULLS = int(secret("MAX_PULLS_PER_DAY", 24))      # board pulls per day (1 credit each); then the odds freeze till midnight
 
 # -------- look --------
 # Cleveland palette: Browns orange #FF3C00 / brown #311D00, Cavs wine #860038 / gold #FDBB30. Icon fonts are left
@@ -115,13 +117,14 @@ def pretty_bets(s):
     return out
 
 # -------- sidebar --------
-st.sidebar.markdown('<div class="sm-brand">🏈 Sharp<span>Model</span><small>Cleveland · live betting board</small></div>',
+st.sidebar.markdown('<div class="sm-brand">🏈 Sharp<span>Model</span><small>live betting board</small></div>',
                     unsafe_allow_html=True)
 league = st.sidebar.radio("League", ["nfl", "cfb"], horizontal=True)
 sc1, sc2 = st.sidebar.columns(2)
 season = sc1.number_input("Season", 2020, 2030, 2026)
 week = sc2.number_input("Week", 1, 22, 1)
-with st.sidebar.expander("Filters", expanded=True):
+filters = st.sidebar.expander("Filters", expanded=True)        # the Teams picker is appended once the board is loaded
+with filters:
     min_ev = st.slider("Min EV %", 0.0, 8.0, 1.5, 0.5) / 100
     hours = st.number_input("Kickoff within (hours)", 1, 2000, 240,
                             help="The API posts the whole season; 240 h = a full Tue-Mon slate.")
@@ -135,7 +138,10 @@ with st.sidebar.expander("Model & refresh", expanded=False):
                              "i.e. stale lines and middles. Above 0 the board fills with the model disagreeing with "
                              "every book at once, which is not a stale line.")
     auto = st.toggle("Auto-refresh", True)
-    if st.button("Force refresh now"):
+    pin = st.text_input("Owner PIN", type="password", help="Set SCAN_PIN in the app secrets before sharing the link: "
+                        "only the PIN can scan props or force a refresh (both spend credits).") if PIN else ""
+    owner = (not PIN) or pin == PIN
+    if owner and st.button("Force refresh now"):
         st.cache_data.clear()
 excl = [b.strip() for b in books_excl.split(",") if b.strip()]
 if "nonus" in excl:
@@ -155,25 +161,43 @@ def model_card(league, season, week):
     wp = SharpModel(league).predict_week(hist, season, week)
     return wp.preds, wp.ratings, wp.market_ratings
 
+@st.cache_resource
+def pull_budget():
+    """Process-wide: pulls today and the last board. Shared by every viewer -- the point is that a link passed
+    around cannot spend more than MAX_PULLS credits a day on the game-line board."""
+    return {"day": None, "n": 0, "last": None}
+
 @st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Pulling odds from every book…")
 def load_odds(league, season):
-    """-> (odds, fetched_at, credits_remaining). Demo file, or the live board (1 credit), or empty without a key."""
+    """-> (odds, fetched_at, credits_remaining, paused). Demo file, or the live board (1 credit), or empty without a
+    key. Past the daily budget the last board is served unchanged (paused=True) until the New York date changes."""
     if DEMO_ODDS:
-        return load_odds_csv(DEMO_ODDS), time.time(), None
+        return load_odds_csv(DEMO_ODDS), time.time(), None, False
+    if not ODDS_KEY:
+        return pd.DataFrame(), time.time(), None, False
+    b, today = pull_budget(), pd.Timestamp.now(tz="America/New_York").date()
+    if b["day"] != today:
+        b["day"], b["n"] = today, 0
+    if b["n"] >= MAX_PULLS:
+        if b["last"] is not None:
+            df, ts, rem = b["last"]
+            return df, ts, rem, True
+        return pd.DataFrame(), time.time(), None, True
     known = None
     if league == "cfb":
         h = load_hist(league, season); known = sorted(set(h.home) | set(h.away))
-    if not ODDS_KEY:
-        return pd.DataFrame(), time.time(), None
     df = fetch_odds(league, api_key=ODDS_KEY, known_teams=known)
-    return df, time.time(), df.attrs.get("remaining")
+    b["n"] += 1
+    b["last"] = (df, time.time(), df.attrs.get("remaining"))
+    return df, time.time(), df.attrs.get("remaining"), False
 
 @st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Pricing the board…")
-def price_board(league, season, week, model_w, min_ev, markets, excl, hours, fetched_at, model_fair):
+def price_board(league, season, week, model_w, min_ev, markets, excl, hours, teams, fetched_at, model_fair):
     """+EV rows and arbs/middles for the sidebar settings. Keyed on fetched_at so a fresh odds pull re-prices;
     otherwise a slider change is a cache hit, not a 30 s recompute. Excluded books still anchor the fairs."""
-    odds, _, _ = load_odds(league, season)
+    odds, _, _, _ = load_odds(league, season)
     odds = within_hours(odds[odds.market.isin(list(markets))], hours)
+    if teams: odds = odds[odds.home.isin(teams) | odds.away.isin(teams)]
     ev = find_ev(odds, league, model_fair=model_fair, model_weight=model_w, min_ev=min_ev)
     if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)
     mids = find_middles(odds, game_fairs(odds, league, model_fair, model_w), league, exclude=list(excl))
@@ -267,7 +291,8 @@ def pick_text(r):
     if r.market == "spreads": return f"{r.team} {r.line:+g}"
     if r.market == "ml": return f"{r.team} ML"
     if r.market == "totals": return f"{str(r.team).capitalize()} {r.line:g}"
-    return f"{r.get('player', '')} {r.side} {r.line:g}"
+    line = "" if pd.isna(r.line) else f" {r.line:g}"
+    return f"{getattr(r, 'player', '')} {str(r.side).capitalize()}{line}"          # props: 'Jalen Hurts Over 264.5'
 
 def pretty_also(s):
     """'espnbet +100; betmgm -102' -> 'ESPN BET +100; BetMGM -102'."""
@@ -278,6 +303,7 @@ def pretty_also(s):
 
 def picks_view(p):
     show = p.copy()
+    if "team" not in show: show["team"] = ""
     show["pick"] = [pick_text(r) for r in show.itertuples()]
     show["commence"] = kickoff(show.commence)
     show["market"] = show.market.map(market)
@@ -409,20 +435,24 @@ def top_cards(ev, mids, min_ev, age, remaining, n_games, n_books):
              "but still set the fair numbers.")
 
 # -------- main --------
-odds, fetched_at, remaining = load_odds(league, season)
+odds, fetched_at, remaining, paused = load_odds(league, season)
 has_odds = not odds.empty                                          # a key and a live pull; the window may still empty the board
 age = (time.time() - fetched_at) / 60
 pills = []
 if DEMO_ODDS: pills.append('<span class="sm-pill demo">demo file</span>')
-pills.append(f'<span class="sm-pill live">● live · odds {age_text(age)}</span>' if has_odds else
-             '<span class="sm-pill warn">no odds key</span>')
+if paused:
+    pills.append(f'<span class="sm-pill warn">paused · {MAX_PULLS} pulls today, odds frozen until midnight</span>')
+else:
+    pills.append(f'<span class="sm-pill live">● live · odds {age_text(age)}</span>' if has_odds else
+                 '<span class="sm-pill warn">no odds key</span>')
 if remaining is not None: pills.append(f'<span class="sm-pill">{remaining} credits left</span>')
 pills.append(f'<span class="sm-pill">{"market only" if model_w == 0 else f"model {model_w:.0%}"}</span>')
 st.markdown(f'<div class="sm-hero"><div><div class="sm-eyebrow">{league.upper()} · {season} · week {week}</div>'
             f'<div class="sm-title">{league.upper()} +EV board</div></div><div class="sm-pills">{"".join(pills)}</div></div>',
             unsafe_allow_html=True)
 if odds.empty:
-    st.warning(NO_KEY)
+    st.warning(f"Daily credit budget reached ({MAX_PULLS} pulls); the board will pull again after midnight New York time."
+               if paused else NO_KEY)
 else:
     try:
         preds, ratings, mkt_ratings = model_card(league, season, week)
@@ -432,8 +462,19 @@ else:
         st.info(f"Model unavailable ({e}); showing pure market-vs-market EV.")
 
     n_posted = odds.event_id.nunique()
+    with filters:
+        teams = st.multiselect("Teams", sorted(set(odds.home) | set(odds.away)), [], placeholder="Type to search…",
+                               help="Only games involving these teams; leave empty for the whole slate.")
+        present = [b for b in odds.book.unique() if b not in excl]
+        keys_by_name = {book(b): b for b in sorted(present, key=lambda b: (b not in BOOK_NAMES, book(b)))}
+        my_books = st.multiselect("Books", list(keys_by_name), [], placeholder="Type to search…",
+                                  help="Only show prices and legs at these books (your accounts); leave empty for all. "
+                                       "Every book still helps set the fair numbers.")
+        if my_books:                                                   # hide the rest as bets, keep them in the fairs
+            keep = {keys_by_name[n] for n in my_books}
+            excl = excl + [b for b in present if b not in keep]
     odds, ev, mids = price_board(league, season, week, model_w, min_ev, tuple(markets), tuple(excl), int(hours),
-                                 fetched_at, model_fair)
+                                 tuple(teams), fetched_at, model_fair)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Games", odds.event_id.nunique(), help=f"kicking off within {hours} h, of {n_posted} posted")
@@ -541,7 +582,9 @@ with tab5:
                    + (": " + ", ".join(f"{r.away}@{r.home}" for r in window.itertuples()) if len(window) else "")
                    + f" — {len(window)} x {len(p_markets)} markets x 1 region = {cost} credits"
                    + (f"; {ev_remaining} left this month." if ev_remaining is not None else "."))
-        if st.button(f"Scan props (≈{cost} credits)", disabled=cost == 0, type="primary"):
+        if not owner:
+            st.caption("🔒 Scanning spends credits — enter the owner PIN in the sidebar (Model & refresh) to enable it.")
+        if st.button(f"Scan props (≈{cost} credits)", disabled=(cost == 0 or not owner), type="primary"):
             try:
                 with st.spinner("Pulling props (one call per game)…"):
                     po = fetch_props(league, window, markets=p_markets, api_key=ODDS_KEY, max_credits=int(credits),
@@ -580,6 +623,9 @@ with tab5:
             m1.metric("Games", po.event_id.nunique()); m2.metric("Books", po.book.nunique()); m3.metric("Prop prices", len(po))
             m4.metric("+EV props", len(pev), help="above the sidebar Min EV %")
             if len(pev):
+                st.markdown('<div class="sm-section">Top prop picks · best book per prop</div>', unsafe_allow_html=True)
+                picks_view(top_picks(pev, 10))
+                st.markdown('<div class="sm-section">Every +EV prop price</div>', unsafe_allow_html=True)
                 ev_view(pev, ["commence", "matchup", "market", "player", "side", "line", "price", "book", "n_books",
                               "market_mu", "proj_mean", "fair_mu", "fair_price", "p_win", "ev_pct", "kelly_stake", "flags"])
             else:

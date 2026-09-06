@@ -89,9 +89,17 @@ card**, **Props** (board, prop middles, prop odds screen). The CLI writes the sa
 `picks_*.csv`, `screen_*.csv` / `props_screen_*.csv`; the `ev scan` Action's summary leads
 with the top picks.
 
-Look: Cleveland — Browns orange on dark brown, Cavs wine and gold for the arb/middle accents
-(`.streamlit/config.toml` + the CSS block at the top of `app.py`). `SHARPMODEL_DEMO_ODDS=
-<odds_*.csv>` runs the whole board off a saved file (no key, no credits) for screenshots.
+Filters (sidebar): min EV, kickoff window, markets, **Teams**, **Books** (your accounts —
+everything else is hidden as a bet but still sets the fair numbers), plus the raw exclude box.
+
+Sharing the link: the board is one pull per 20 min for *everyone*, capped by
+`MAX_PULLS_PER_DAY` (then it freezes until midnight); set `SCAN_PIN` so only you can scan
+props or force a refresh — see DEPLOY.md.
+
+Look: Browns orange on dark brown with Cavs wine/gold accents (`.streamlit/config.toml` +
+the CSS block at the top of `app.py`); signal colours stay universal (green best price, red
+off-number). `SHARPMODEL_DEMO_ODDS=<odds_*.csv>` runs the whole board off a saved file (no
+key, no credits) for screenshots.
 
 ## Multi-book +EV scanner (`odds.py`)
 

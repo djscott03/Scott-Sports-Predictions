@@ -37,6 +37,23 @@
   games × markets credits (the estimate is on the button, ≈24 with the defaults). It
   never fetches on its own and keeps the last scan until you click again.
 
+### Sharing the link with friends (credits)
+- The game-line board is **shared**: one pull per `REFRESH_MIN` minutes for everyone
+  combined, not per viewer. Ten people watching costs the same as one. What costs
+  more is *coverage*: a tab left open all day keeps pulling (3 credits/hour at the
+  20-minute default).
+- `MAX_PULLS_PER_DAY` (default 24) caps that: past the budget the last board is served
+  unchanged with a "paused" pill until midnight New York time. 24/day ≈ 8 hours of
+  continuous viewing ≈ at most 720 credits/month if it were hammered every day — set
+  12 if you share widely, or raise `REFRESH_MIN` to 30.
+- **Set `SCAN_PIN` before sharing.** Props scans bill games × markets credits to whoever
+  clicks, and Force refresh is a credit too. With the PIN set, both need it (sidebar →
+  Model & refresh → Owner PIN); viewers can still see the last props scan.
+  ```toml
+  SCAN_PIN = "pick-something"
+  MAX_PULLS_PER_DAY = "24"
+  ```
+
 ### Run it locally instead
 ```bash
 pip install -r requirements.txt

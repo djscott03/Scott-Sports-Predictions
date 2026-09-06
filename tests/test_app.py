@@ -38,8 +38,10 @@ def _prop_event(events):
 
 def _run(monkeypatch, key):
     st.cache_data.clear()                                   # st.cache_data is process-wide across AppTest runs
+    st.cache_resource.clear()                               # so is the daily pull budget
     if key: monkeypatch.setenv("ODDS_API_KEY", key)
     else: monkeypatch.delenv("ODDS_API_KEY", raising=False)
+    for v in ("SCAN_PIN", "MAX_PULLS_PER_DAY"): monkeypatch.delenv(v, raising=False)
     at = AppTest.from_file(APP, default_timeout=120)
     at.run()
     assert not at.exception, at.exception
@@ -92,6 +94,24 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     assert float(view["EV %"].iloc[0]) > 0 and any("worse-priced leg first" in c.value for c in tab.caption)
     assert [m.label for m in at.metric][:4] == ["Games", "Books", "+EV lines", "Arbs & middles"]
     assert at.metric[3].value == "1"
+    # team filter: KC is not in DAL @ PHI; PHI is
+    [teams] = [m for m in at.multiselect if m.label == "Teams"]
+    assert teams.options == ["DAL", "PHI"] and teams.value == []
+    teams.set_value(["KC"]).run() if "KC" in teams.options else teams.set_value(["DAL"]).run()
+    assert not at.exception, at.exception
+    assert at.metric[3].value == "1"                                   # DAL is in the game -> still there
+    [teams] = [m for m in at.multiselect if m.label == "Teams"]
+    teams.set_value([]).run()
+    assert at.metric[0].value == "1"
+    # books filter: friendly names; picking only FanDuel removes Pinnacle as a leg (it still anchors the fair)
+    [books] = [m for m in at.multiselect if m.label == "Books"]
+    assert books.options == ["FanDuel", "Pinnacle"] and books.value == []
+    books.set_value(["FanDuel"]).run()
+    assert not at.exception, at.exception
+    assert at.metric[3].value == "0"
+    [books] = [m for m in at.multiselect if m.label == "Books"]
+    books.set_value([]).run()
+    assert at.metric[3].value == "1"
     # kickoff window: only e1 has lines (30 h out); a 20 h window empties the board without a new odds pull
     assert at.metric[0].value == "1"
     [n for n in at.number_input if n.label.startswith("Kickoff within")][0].set_value(20).run()
@@ -140,17 +160,17 @@ def test_scan_button_bills_once_and_the_board_survives_reruns(monkeypatch):
     board = at.session_state["props"]["ev"]
     assert set(zip(board.book, board.side)) == {("fanduel", "over"), ("draftkings", "under")}   # both beat the 264.5 consensus
     assert (board.ev_pct >= 0.015).all() and (board["flags"] == "no_proj").all()
-    assert len(at.dataframe) == 3                                   # board, prop middles, prop odds screen
+    assert len(at.dataframe) == 4                                   # board, prop middles, prop odds screen
     mid = at.session_state["props"]["mid"]                            # the same two books make a 20-yard middle
     assert len(mid) == 1 and mid.iloc[0].window == "255-274" and mid.iloc[0].type == "middle" and mid.iloc[0].ev_pct > 0
     assert mid.iloc[0].bet_a == "J. Hurts O 254.5 -110 @ fanduel" and mid.iloc[0].bet_b == "J. Hurts U 274.5 -110 @ draftkings"
-    assert "leg A" in at.dataframe[1].value.columns and "middle %" in at.dataframe[1].value.columns
+    assert "leg A" in at.dataframe[2].value.columns and "middle %" in at.dataframe[2].value.columns   # picks, board, middles, screen
     assert any("Projections unavailable" in i.value for i in at.info)
     n = len(calls)
     at.run()                                                          # rerun (auto-refresh, slider move, ...)
     assert not at.exception, at.exception
     assert len(calls) == n and calls.count(billed) == 1               # nothing re-fetched; events/odds are cached
-    assert len(at.session_state["props_odds"]["odds"]) == 4 and len(at.dataframe) == 3
+    assert len(at.session_state["props_odds"]["odds"]) == 4 and len(at.dataframe) == 4
 
 
 def test_scan_remaining_beats_the_cached_events_count(monkeypatch):
@@ -182,3 +202,51 @@ def test_scan_remaining_beats_the_cached_events_count(monkeypatch):
     assert not at.exception, at.exception
     assert calls.count(billed) == 1 and any("52 credits remaining - 4 per call < reserve=50" in e.value for e in at.error)
     assert len(at.session_state["props_odds"]["odds"]) == 4           # the first scan's board is untouched
+
+
+def test_owner_pin_gates_scans_and_force_refresh(monkeypatch):
+    """With SCAN_PIN set, only the PIN can spend credits: Scan props is disabled and Force refresh hidden until it is
+    entered in the sidebar."""
+    events = _upcoming()
+    def fake_get(url, params=None, timeout=None):
+        if url == ODDS_API.format(sport=NFL): return _Resp([])
+        if url == EVENTS_API.format(sport=NFL): return _Resp(events, {"x-requests-remaining": "450"})
+        raise AssertionError(f"unexpected call: {url}")
+    monkeypatch.setattr(requests, "get", fake_get)
+    at = _run(monkeypatch, "k")
+    assert any(b.label == "Force refresh now" for b in at.button)                  # no PIN configured: open
+    [btn] = [b for b in at.button if b.label.startswith("Scan props")]
+    assert not btn.disabled
+    monkeypatch.setenv("SCAN_PIN", "1234"); at.run()
+    assert not at.exception, at.exception
+    assert not any(b.label == "Force refresh now" for b in at.button)
+    [btn] = [b for b in at.button if b.label.startswith("Scan props")]
+    assert btn.disabled and any("owner PIN" in c.value for c in at.caption)
+    [pin] = [t for t in at.text_input if t.label == "Owner PIN"]
+    pin.set_value("1234").run()
+    assert not at.exception, at.exception
+    [btn] = [b for b in at.button if b.label.startswith("Scan props")]
+    assert not btn.disabled and any(b.label == "Force refresh now" for b in at.button)
+
+
+def test_daily_pull_budget_freezes_the_board(monkeypatch):
+    """A shared link cannot spend more than MAX_PULLS_PER_DAY credits on the board: past the budget the last board is
+    served unchanged with a 'paused' pill, and the API is not called again."""
+    events, calls = _upcoming(), []
+    def fake_get(url, params=None, timeout=None):
+        calls.append(url)
+        if url == ODDS_API.format(sport=NFL): return _Resp(_game_event(events), {"x-requests-remaining": "450"})
+        if url == EVENTS_API.format(sport=NFL): return _Resp(events, {"x-requests-remaining": "450"})
+        raise AssertionError(f"unexpected call: {url}")
+    monkeypatch.setattr(requests, "get", fake_get)
+    def no_nflverse(*a, **k): raise RuntimeError("offline test")
+    monkeypatch.setattr(sharpmodel, "load_nfl", no_nflverse)
+    at = _run(monkeypatch, "k")
+    assert calls.count(ODDS_API.format(sport=NFL)) == 1 and at.metric[0].value == "1"
+    monkeypatch.setenv("MAX_PULLS_PER_DAY", "1")
+    st.cache_data.clear()                                            # the 20-minute cache expired: normally a new pull
+    at.run()
+    assert not at.exception, at.exception
+    assert calls.count(ODDS_API.format(sport=NFL)) == 1              # budget spent: no second pull
+    assert at.metric[0].value == "1"                                 # ...but the last board is still served
+    assert any("paused" in m.value for m in at.markdown)

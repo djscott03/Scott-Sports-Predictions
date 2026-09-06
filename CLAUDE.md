@@ -48,9 +48,12 @@ app.py                     Streamlit dashboard, Cleveland theme (.streamlit/conf
                            prop middles + prop odds screen under the board]. Hero pills + 'Right now' cards (best
                            +EV line, best arb/middle, board status); price_board cached on sidebar settings +
                            fetched_at. SHARPMODEL_DEMO_ODDS=<odds_*.csv> runs it off a file (no key, no credits).
-                           Never override font-family globally: Material icons become their literal names.
+                           Sharing guards: SCAN_PIN (gates props scans + force refresh), MAX_PULLS_PER_DAY (default
+                           24; st.cache_resource budget, then the last board is served 'paused' till midnight NY).
+                           Sidebar Filters: min EV, window, markets, Teams, Books (pretty names -> extra exclusions),
+                           raw exclude box. Never override font-family globally: Material icons become their names.
 lines_template.csv         --csv schema for game lines;  props_template.csv  --csv schema for props (both tracked)
-tests/                     offline pytest (93 tests, ~8s; incl. AppTest smoke + subprocess runs of run.py ev/props);
+tests/                     offline pytest (95 tests, ~8s; incl. AppTest smoke + subprocess runs of run.py ev/props);
                            conftest chdir's to repo root
 .github/workflows/ci.yml           pytest on push/PR (python 3.12)
 .github/workflows/weekly-card.yml  cron Tue+Thu 13:00 UTC + manual dispatch; commits predictions/
@@ -124,7 +127,7 @@ tests/                     offline pytest (93 tests, ~8s; incl. AppTest smoke + 
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
 
 ## Verified state (2026-09-05, local .venv on python 3.9; CI uses 3.12)
-- `python -m pytest -q tests` → 93 passed in ~8s (15 original + props projections/pricing,
+- `python -m pytest -q tests` → 95 passed in ~8s (15 original + props projections/pricing,
   prop ingestion + run.py subprocess runs, dashboard AppTest, publish grading, holdout,
   `tests/test_margins.py`, `tests/test_middles.py` incl. a subprocess run of run.py ev + props;
   the 2026-09-05 second review pass added 9: yes-only longshot bound, bad-body / transport-failure
