@@ -80,11 +80,18 @@ book), non-US books excluded as bets, games kicking off within 240 h. Changing a
 instant (the board is cached until the next odds pull); the Props tab spends nothing until you
 click its button.
 
-Tabs: **+EV plays** (one line per stale price), **Arbs & middles** (two-leg plays), **Odds
-screen** (one row per pick, one column per sportsbook, `number price` in each cell — the best
-price on the market's number is green, a book sitting on a *different* number is amber, which is
-where middles come from), **Model card**, **Props** (board, prop middles, prop odds screen).
-The CLI writes the same grid to `screen_*.csv` / `props_screen_*.csv`.
+Tabs: **Top picks** (the +EV board deduped to one row per pick at its best book, ranked by
+EV, with the other books on the same number in *Also at*), **+EV plays** (every stale price),
+**Arbs & middles** (two-leg plays), **Odds screen** (one row per pick, one column per
+sportsbook, `number price` in each cell — the best price on the market's number is green, a
+book sitting on a *different* number is red, which is where middles come from), **Model
+card**, **Props** (board, prop middles, prop odds screen). The CLI writes the same things to
+`picks_*.csv`, `screen_*.csv` / `props_screen_*.csv`; the `ev scan` Action's summary leads
+with the top picks.
+
+Look: Cleveland — Browns orange on dark brown, Cavs wine and gold for the arb/middle accents
+(`.streamlit/config.toml` + the CSS block at the top of `app.py`). `SHARPMODEL_DEMO_ODDS=
+<odds_*.csv>` runs the whole board off a saved file (no key, no credits) for screenshots.
 
 ## Multi-book +EV scanner (`odds.py`)
 

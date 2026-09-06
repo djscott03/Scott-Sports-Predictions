@@ -18,7 +18,7 @@ Add --epa to use play-by-play EPA (NFL only, slower first download).
 import sys, json
 import pandas as pd
 from sharpmodel import SharpModel, summarize_backtest, load_nfl, load_cfb
-from sharpmodel.odds import fetch_odds, load_odds_csv, find_ev, best_lines, within_hours, odds_grid
+from sharpmodel.odds import fetch_odds, load_odds_csv, find_ev, best_lines, within_hours, odds_grid, top_picks
 from sharpmodel.middles import find_middles, game_fairs, prop_fairs
 
 pd.set_option("display.width", 200); pd.set_option("display.max_columns", 40)
@@ -105,8 +105,13 @@ elif mode == "ev":
           + (f"; fair = {1 - weight:.0%} sharp book / {weight:.0%} model" if weight > 0 else "; fair = sharp book only"))
     ev = find_ev(odds, league, model_fair=model_fair, model_weight=weight, min_ev=0.015)
     if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)
+    picks = top_picks(ev, 10)
+    print("\n=== TOP PICKS (one row per pick at its best price; 'also' = other books on the same number) ===")
+    print(picks[["rank", "matchup", "market", "team", "line", "price", "book", "also", "fair_price", "p_win", "ev_pct",
+                 "kelly_stake"]].round(3).to_string(index=False) if len(picks) else "none above threshold")
+    picks.to_csv(f"picks_{league}_{season}_w{week}.csv", index=False)
     cols = ["matchup", "market", "team", "line", "price", "book", "ref_book", "fair_price", "p_win", "ev_pct", "kelly_stake"]
-    print("\n=== +EV LINES (vs sharp-book fair, sorted by EV) ===")
+    print("\n=== +EV LINES (every book, vs sharp-book fair, sorted by EV) ===")
     print(ev[cols].round(3).to_string(index=False) if len(ev) else "none above threshold")
     mids = find_middles(odds, game_fairs(odds, league, model_fair, weight), league, exclude=excl)
     print_middles(mids, "ARBS & MIDDLES")

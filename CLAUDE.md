@@ -40,11 +40,17 @@ run.py                     CLI: backtest | predict | ev (--csv --hours --exclude
                            --exclude takes book keys or 'nonus' (odds.NON_US_BOOKS)
 holdout.py                 fit blend weight on early seasons, confirm on held-out ones
 publish_card.py            auto-detect week -> predictions/<league>/<season>_wNN.{md,csv} + graded README index
-app.py                     Streamlit dashboard (tabs: +EV, arbs & middles, odds screen [odds.odds_grid: row per
-                           pick x column per book, best price green / off-number amber], model card, props
-                           [button-gated; prop middles + prop odds screen under the board])
+app.py                     Streamlit dashboard, Cleveland theme (.streamlit/config.toml + CSS block). Tabs: top picks
+                           (odds.top_picks: one row per pick at its best book, 'also' = other books on the number),
+                           +EV, arbs & middles, odds screen [odds.odds_grid: row per pick x column per book, best
+                           price GREEN / off-number RED (signal colours stay universal; the Cleveland palette is
+                           chrome only), pinned Game/Pick], model card, props [button-gated;
+                           prop middles + prop odds screen under the board]. Hero pills + 'Right now' cards (best
+                           +EV line, best arb/middle, board status); price_board cached on sidebar settings +
+                           fetched_at. SHARPMODEL_DEMO_ODDS=<odds_*.csv> runs it off a file (no key, no credits).
+                           Never override font-family globally: Material icons become their literal names.
 lines_template.csv         --csv schema for game lines;  props_template.csv  --csv schema for props (both tracked)
-tests/                     offline pytest (91 tests, ~7s; incl. AppTest smoke + subprocess runs of run.py ev/props);
+tests/                     offline pytest (93 tests, ~8s; incl. AppTest smoke + subprocess runs of run.py ev/props);
                            conftest chdir's to repo root
 .github/workflows/ci.yml           pytest on push/PR (python 3.12)
 .github/workflows/weekly-card.yml  cron Tue+Thu 13:00 UTC + manual dispatch; commits predictions/
@@ -118,7 +124,7 @@ tests/                     offline pytest (91 tests, ~7s; incl. AppTest smoke + 
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
 
 ## Verified state (2026-09-05, local .venv on python 3.9; CI uses 3.12)
-- `python -m pytest -q tests` → 91 passed in ~7s (15 original + props projections/pricing,
+- `python -m pytest -q tests` → 93 passed in ~8s (15 original + props projections/pricing,
   prop ingestion + run.py subprocess runs, dashboard AppTest, publish grading, holdout,
   `tests/test_margins.py`, `tests/test_middles.py` incl. a subprocess run of run.py ev + props;
   the 2026-09-05 second review pass added 9: yes-only longshot bound, bad-body / transport-failure

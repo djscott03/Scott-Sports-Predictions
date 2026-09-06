@@ -24,7 +24,7 @@ import streamlit as st
 
 from sharpmodel import SharpModel, load_nfl, load_cfb, props
 from sharpmodel.odds import (fetch_odds, find_ev, best_lines, parse_odds_json, fetch_events, fetch_props, within_hours,
-                             odds_grid, load_odds_csv, NON_US_BOOKS,
+                             odds_grid, load_odds_csv, NON_US_BOOKS, top_picks,
                              estimate_prop_credits, PROP_MARKETS_DEFAULT, PROP_MARKETS_ALL)
 from sharpmodel.props import load_player_weeks, project_players, fit_dispersion, price_props
 from sharpmodel.middles import find_middles, game_fairs, prop_fairs
@@ -221,9 +221,9 @@ MID_NOTE = ("Two legs at two books, stakes split so a miss (the sides split) cos
             "margin distribution, so a 3 counts ~3x what a Normal says). arb / free_middle cannot lose; half_middle "
             "wins one leg on the 'Np' number while the other pushes. Lines move within minutes: place the "
             "worse-priced leg first, confirm it is accepted, then the other. Same-book pairs are excluded.")
-SCREEN_NOTE = ("One row per pick, one column per book, cell = 'number price'. Orange = the best price among the books "
-               "on the market's number; wine = that book is on a DIFFERENT number (a middle candidate: see Arbs & "
-               "middles). 'Best' repeats the orange cell; excluded books are hidden.")
+SCREEN_NOTE = ("One row per pick, one column per book, cell = 'number price'. Green = the best price among the books "
+               "on the market's number; red = that book is on a DIFFERENT number (a middle candidate: see Arbs & "
+               "middles). 'Best' repeats the green cell; excluded books are hidden.")
 
 def ev_cfg(max_ev):
     return {"commence": st.column_config.TextColumn("Kickoff", width="small"),
@@ -262,6 +262,41 @@ def ev_view(ev, cols):
     if "ref_book" in show: show["ref_book"] = show.ref_book.map(book)
     cols = [c for c in cols if c in show]
     st.dataframe(show[cols], width="stretch", hide_index=True, column_config=ev_cfg(show.ev_pct.max()))
+
+def pick_text(r):
+    if r.market == "spreads": return f"{r.team} {r.line:+g}"
+    if r.market == "ml": return f"{r.team} ML"
+    if r.market == "totals": return f"{str(r.team).capitalize()} {r.line:g}"
+    return f"{r.get('player', '')} {r.side} {r.line:g}"
+
+def pretty_also(s):
+    """'espnbet +100; betmgm -102' -> 'ESPN BET +100; BetMGM -102'."""
+    def one(x):
+        parts = x.split(" ", 1)
+        return f"{book(parts[0])} {parts[1]}" if len(parts) == 2 else x
+    return s.fillna("").astype(str).map(lambda v: "; ".join(one(x) for x in v.split("; ") if x))
+
+def picks_view(p):
+    show = p.copy()
+    show["pick"] = [pick_text(r) for r in show.itertuples()]
+    show["commence"] = kickoff(show.commence)
+    show["market"] = show.market.map(market)
+    show["book"] = show.book.map(book)
+    show["price"] = show.price.map(am)
+    show["fair_price"] = show.fair_price.map(am)
+    show["also"] = pretty_also(show.also)
+    show["ev_pct"] = (show.ev_pct * 100).round(2)
+    show["p_win"] = (show.p_win * 100).round(1)
+    show["kelly_stake"] = (show.kelly_stake * 100).round(2)
+    cols = ["rank", "commence", "matchup", "market", "pick", "price", "book", "also", "fair_price", "p_win", "ev_pct",
+            "kelly_stake"]
+    cfg = ev_cfg(show.ev_pct.max())
+    cfg.update({"rank": st.column_config.NumberColumn("#", width="small"),
+                "pick": st.column_config.TextColumn("Pick", width="small"),
+                "book": st.column_config.TextColumn("Best book"),
+                "also": st.column_config.TextColumn("Also at", width="large")})
+    st.dataframe(show[cols], width="stretch", hide_index=True, column_config=cfg,
+                 height=int(min(80 + 35 * (len(show) + 1), 480)))
 
 def mid_cfg(max_ev):
     return {"commence": st.column_config.TextColumn("Kickoff", width="small"),
@@ -312,8 +347,8 @@ def screen_view(grid, best, off):
     b, o = best.to_numpy(dtype=bool), off.to_numpy(dtype=bool)          # plain arrays: no pandas truthiness anywhere
     def paint(col):
         j = pretty.index(col.name)
-        return np.where(b[:, j], "background-color:#7a2a10;color:#ffe3d6;font-weight:700",       # Browns orange: best price
-                        np.where(o[:, j], "background-color:#5a0026;color:#ffd6e6", "")).tolist()  # Cavs wine: off the number
+        return np.where(b[:, j], "background-color:#166534;color:#dcfce7;font-weight:700",       # green: best price on the number
+                        np.where(o[:, j], "background-color:#7f1d1d;color:#fee2e2", "")).tolist()  # red: a different number
     cfg = {"commence": st.column_config.TextColumn("Kickoff", width="small"),
            "matchup": pinned(st.column_config.TextColumn, "Game", width="small"),
            "market": st.column_config.TextColumn("Market", width="small"),
@@ -410,10 +445,26 @@ else:
     top_cards(ev, mids, min_ev, age, remaining, odds.event_id.nunique(), odds.book.nunique())
     st.markdown('<div class="sm-section">The board</div>', unsafe_allow_html=True)
 
-labels = ["+EV plays", "Arbs & middles", "Odds screen", "Model card", "Props"]
-if has_odds: labels[0], labels[1] = f"+EV plays · {len(ev)}", f"Arbs & middles · {len(mids)}"
-tab1, tab2, tab3, tab4, tab5 = st.tabs(labels)
+labels = ["Top picks", "+EV plays", "Arbs & middles", "Odds screen", "Model card", "Props"]
 if has_odds:
+    picks = top_picks(ev, 10)
+    labels[0], labels[1], labels[2] = f"Top picks · {len(picks)}", f"+EV plays · {len(ev)}", f"Arbs & middles · {len(mids)}"
+tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs(labels)
+if has_odds:
+    with tab0:
+        with st.expander("How to read this"):
+            st.markdown("- The same list as **+EV plays**, but one row per pick at its **best book** — 'CHI −3 +100' "
+                        "is one pick even when five books post it. **Also at** shows the other books on the same number, "
+                        "best price first, so you can go where you have an account.\n"
+                        "- Ranked by EV %. **Stake %** is a quarter-Kelly size; spread it across books rather than "
+                        "hammering one.\n"
+                        "- Lines move within minutes of a sharp move — check the price is still there before you bet.")
+        if len(picks):
+            picks_view(picks)
+            st.caption(f"Top {len(picks)} of {len(ev)} +EV prices on the board, deduped to one row per pick. "
+                       "Fair prices from the sharp reference book; stakes quarter-Kelly, capped at 3% of bankroll.")
+        else:
+            st.success("Nothing above your EV threshold right now — that's normal on an efficient board.")
     with tab1:
         with st.expander("How to read this"):
             st.markdown("- One row = one book's price that is better than the sharp fair price for that exact line.\n"
@@ -444,8 +495,8 @@ if has_odds:
     with tab3:
         with st.expander("How to read this"):
             st.markdown("- Every sportsbook's number and price for every pick, side by side. Scroll right for more books.\n"
-                        "- **Orange** = the best price on the market's number (the *Best* column repeats it). "
-                        "**Wine** = that book is on a *different* number — compare it with the Arbs & middles tab.\n"
+                        "- **Green** = the best price on the market's number (the *Best* column repeats it). "
+                        "**Red** = that book is on a *different* number — compare it with the Arbs & middles tab.\n"
                         "- Hidden books (the sidebar's *Exclude books*) still set the fair numbers, they just can't be bet.")
         screen_view(*odds_grid(odds, exclude=excl, masks=True))
     with tab4:

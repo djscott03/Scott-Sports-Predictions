@@ -70,8 +70,15 @@ jobs:
               d = d[[c for c in cols if c in d]].head(n).round(3).fillna("")
               print("| " + " | ".join(d.columns) + " |"); print("|" + "---|" * len(d.columns))
               for r in d.itertuples(index=False): print("| " + " | ".join(str(v) for v in r) + " |")
+          picks = load(f"picks_{league}_{season}_w{week}.csv")
+          print(f"## {league} top picks {season} w{week} — one row per pick at its best price\n")
+          if len(picks):
+              table(picks, ["rank", "matchup", "market", "team", "line", "price", "book", "also", "fair_price", "p_win",
+                            "ev_pct", "kelly_stake"])
+          else:
+              print("no picks above the +1.5% EV threshold")
           ev = load(f"ev_{league}_{season}_w{week}.csv")
-          print(f"## {league} +EV scan {season} w{week} — top {min(len(ev), 25)} of {len(ev)} by EV\n")
+          print(f"\n## every +EV line — top {min(len(ev), 25)} of {len(ev)} by EV\n")
           if len(ev):
               table(ev, ["matchup", "market", "team", "line", "price", "book", "ref_book", "fair_price", "p_win",
                          "ev_pct", "kelly_stake"])
@@ -90,6 +97,7 @@ jobs:
           name: ev-${{ inputs.league }}-${{ inputs.season }}-w${{ inputs.week }}
           path: |
             ev_*.csv
+            picks_*.csv
             middles_*.csv
             screen_*.csv
             bestlines_*.csv

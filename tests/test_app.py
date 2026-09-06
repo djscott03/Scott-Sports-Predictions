@@ -9,7 +9,7 @@ import sharpmodel
 from sharpmodel import props
 from sharpmodel.odds import ODDS_API, EVENTS_API, PROPS_API
 
-TABS = ["+EV plays", "Arbs & middles", "Odds screen", "Model card", "Props"]
+TABS = ["Top picks", "+EV plays", "Arbs & middles", "Odds screen", "Model card", "Props"]
 NFL = "americanfootball_nfl"
 APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")   # streamlit >= 1.5x resolves
                                                                                              # relative paths against this file
@@ -75,7 +75,7 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     monkeypatch.setattr(sharpmodel, "load_nfl", no_nflverse)          # model card unavailable -> market-only fairs
     at = _run(monkeypatch, "k")
     assert any("Model unavailable" in i.value for i in at.info)
-    tab = at.tabs[1]
+    tab = at.tabs[2]
     # sidebar default 'nonus': pinnacle still anchors the fair but cannot be a leg -> nothing to show
     assert tab.label == "Arbs & middles · 0" and len(tab.dataframe) == 0
     assert any("No cross-book arbs" in s.value for s in tab.success) and at.metric[3].value == "0"
@@ -83,7 +83,7 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     assert box.value == "nonus"
     box.set_value("").run()                                            # allow every book as a leg
     assert not at.exception, at.exception
-    tab = at.tabs[1]
+    tab = at.tabs[2]
     assert len(tab.dataframe) == 1
     view = tab.dataframe[0].value
     assert list(view["leg A"]) == ["PHI -2.5 -110 @ Pinnacle"] and list(view["leg B"]) == ["DAL +3.5 -110 @ FanDuel"]
@@ -97,7 +97,7 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     [n for n in at.number_input if n.label.startswith("Kickoff within")][0].set_value(20).run()
     assert not at.exception, at.exception
     assert at.metric[0].value == "0" and at.metric[3].value == "0"
-    assert any("No cross-book arbs" in s.value for s in at.tabs[1].success)
+    assert any("No cross-book arbs" in s.value for s in at.tabs[2].success)
 
 
 def test_props_tab_never_fetches_on_load(monkeypatch):
