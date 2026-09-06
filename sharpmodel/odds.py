@@ -430,22 +430,25 @@ def _cell(market, line, price) -> str:
     return f"{line:g} {p}"                                             # totals / props: over-under is the row
 
 
-def odds_grid(odds: pd.DataFrame, exclude=None) -> pd.DataFrame:
+def odds_grid(odds: pd.DataFrame, exclude=None, masks: bool = False):
     """
     Odds screen: one row per matchup x market x pick (x player for props), one column per book, cell = 'line price'
     ('-2.5 -110', '47.5 -105', '+130'). Per (row, book) the entry nearest the row's modal number is kept (best price
     on ties) so alternate lines do not duplicate rows. Books in US_BOOKS order first, then the rest alphabetically;
     trailing columns best ('-105 @ pinnacle': best price among books AT the modal number) and books (count).
-    grid.attrs['best'] / grid.attrs['off_line']: boolean frames (same rows, book columns) for highlighting -- the best
-    price at the number, and a book posting a DIFFERENT number (look in Arbs & middles). Empty in -> empty out.
+    masks=True also returns two boolean frames (same rows, book columns) for highlighting: the best price at the
+    number, and a book posting a DIFFERENT number (look in Arbs & middles). They are returned, not stored in
+    DataFrame.attrs: pandas 3 compares attrs on every concat and a DataFrame in there is an ambiguous truth value.
+    Empty in -> empty out.
     """
-    if odds is None or len(odds) == 0 or "book" not in odds: return pd.DataFrame()
+    empty = (pd.DataFrame(), pd.DataFrame(), pd.DataFrame()) if masks else pd.DataFrame()
+    if odds is None or len(odds) == 0 or "book" not in odds: return empty
     o = odds.copy()
     if exclude is not None and len(exclude): o = o[~o.book.isin(set(exclude))]
     o["line"] = pd.to_numeric(o["line"], errors="coerce") if "line" in o else np.nan
     o["price"] = pd.to_numeric(o["price"], errors="coerce")
     o = o[o.price.notna()]
-    if o.empty: return pd.DataFrame()
+    if o.empty: return empty
     o["commence"] = o["commence"].fillna("").astype(str) if "commence" in o else ""
     o["matchup"] = o.away.astype(str) + " @ " + o.home.astype(str)
     o["pick"] = np.where(o.market.isin(["spreads", "ml"]), np.where(o.side == "home", o.home, o.away), o.side)
@@ -484,8 +487,7 @@ def odds_grid(odds: pd.DataFrame, exclude=None) -> pd.DataFrame:
         offb = set(g[g._gap > 0].book)
         off.append({bk: bk in offb for bk in books})
     grid = pd.DataFrame(txt, columns=keys + books + ["best", "books"])
-    grid.attrs["best"] = pd.DataFrame(best, columns=books)
-    grid.attrs["off_line"] = pd.DataFrame(off, columns=books)
+    if masks: return grid, pd.DataFrame(best, columns=books), pd.DataFrame(off, columns=books)
     return grid
 
 

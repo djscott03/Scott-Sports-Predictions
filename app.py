@@ -135,18 +135,26 @@ SCREEN_NOTE = ("One row per pick, one column per book, cell = 'number price'. Gr
                "middles). 'best' is the green cell; excluded books are hidden.")
 
 
-def screen_view(grid):
-    """The odds screen: best price at the number in green, off-number books in amber."""
+def screen_view(grid, best, off):
+    """The odds screen (odds_grid(..., masks=True)): best price at the number in green, off-number books in amber."""
     if grid is None or grid.empty:
         st.success("No lines in the window."); return
     show = grid.copy()
     if show.commence.astype(bool).any(): show["commence"] = kickoff(show.commence)
-    best, off = grid.attrs["best"], grid.attrs["off_line"]
     books = list(best.columns)
+    b, o = best.to_numpy(dtype=bool), off.to_numpy(dtype=bool)          # plain arrays: no pandas truthiness anywhere
     def paint(col):
-        return np.where(best[col.name].values, "background-color:#1b5e20;color:#fff",
-                        np.where(off[col.name].values, "background-color:#7a5c00;color:#fff", ""))
-    st.dataframe(show.style.apply(paint, axis=0, subset=books), width="stretch", hide_index=True)
+        j = books.index(col.name)
+        return np.where(b[:, j], "background-color:#1b5e20;color:#fff",
+                        np.where(o[:, j], "background-color:#7a5c00;color:#fff", "")).tolist()
+    try:
+        st.dataframe(show.style.apply(paint, axis=0, subset=books), width="stretch", hide_index=True)
+    except Exception:                                                     # a pandas/streamlit Styler mismatch never takes the page down
+        marked = show.copy()
+        for j, bk in enumerate(books):
+            marked[bk] = np.where(b[:, j], "★ ", np.where(o[:, j], "≠ ", "")) + marked[bk].astype(str)
+        st.dataframe(marked, width="stretch", hide_index=True)
+        st.caption("★ = best price on the number, ≠ = a different number (colour styling unavailable in this pandas build).")
     st.caption(SCREEN_NOTE)
 
 
@@ -210,7 +218,7 @@ if has_odds:
             st.success("No cross-book arbs or +EV middles on the board right now.")
         st.caption(MID_NOTE)
     with tab3:
-        screen_view(odds_grid(odds, exclude=excl))
+        screen_view(*odds_grid(odds, exclude=excl, masks=True))
     with tab4:
         if preds is not None:
             cols = ["away", "home", "market_margin", "model_margin", "fair_margin", "spread_side",
@@ -308,7 +316,7 @@ with tab5:
             else:
                 st.caption("No cross-book prop arbs or +EV middles in the last scan. " + MID_NOTE)
             st.subheader("Prop odds screen")
-            screen_view(odds_grid(raw["odds"], exclude=excl))
+            screen_view(*odds_grid(raw["odds"], exclude=excl, masks=True))
             st.caption(f"Scanned {pd.Timestamp.fromtimestamp(raw['at']).strftime('%H:%M:%S')} server time; the board stays "
                        "until you scan again. Quota: each scan bills games x markets x regions credits from the free "
                        "500/month Odds API tier (the ≈N on the button), on top of the main board's 1 per refresh. "

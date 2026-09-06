@@ -18,7 +18,9 @@ sharpmodel/adjustments.py  rest, wind/temp, QB-change flags, manual injury hook
 sharpmodel/engine.py       SharpModel.fit_as_of / price_games / predict_week / backtest, BetTracker (CLV)
 sharpmodel/odds.py         The Odds API (ODDS_API_KEY) + CSV ingest, sharp_fair -> blended_fair (model nudge),
                            find_ev, best_lines, find_arbs (legacy same-number arbs; middles.py supersedes it),
-                           within_hours, NON_US_BOOKS / US_BOOKS, odds_grid (the odds screen; attrs best/off_line);
+                           within_hours, NON_US_BOOKS / US_BOOKS, odds_grid (the odds screen; masks=True also
+                           returns the best / off-number boolean frames -- never put a DataFrame in .attrs:
+                           pandas 3 compares attrs on every concat and raises 'truth value is ambiguous');
                            every HTTP call goes through _get -> OddsAPIError (status + body, never the URL/key);
                            player-prop ingest: fetch_events (free; attrs['remaining']) -> estimate_prop_credits ->
                            fetch_props (per event; skips failed games, attrs['failed'], stops on 401/402/429)
