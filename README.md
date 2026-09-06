@@ -75,6 +75,10 @@ needed for NFL.
 
 ## Live dashboard
 `streamlit run app.py` locally, or deploy free to Streamlit Community Cloud — see **DEPLOY.md**.
+The sidebar defaults are the sharp defaults: model blend 0 (sharp-book market vs. every other
+book), non-US books excluded as bets, games kicking off within 240 h. Changing a slider is
+instant (the board is cached until the next odds pull); the Props tab spends nothing until you
+click its button.
 
 ## Multi-book +EV scanner (`odds.py`)
 

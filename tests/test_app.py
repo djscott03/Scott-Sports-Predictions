@@ -92,6 +92,12 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     assert float(view["EV %"].iloc[0]) > 0 and any("worse-priced leg first" in c.value for c in tab.caption)
     assert [m.label for m in at.metric][:4] == ["Games", "Books", "+EV lines", "Arbs & middles"]
     assert at.metric[3].value == "1"
+    # kickoff window: only e1 has lines (30 h out); a 20 h window empties the board without a new odds pull
+    assert at.metric[0].value == "1"
+    [n for n in at.number_input if n.label.startswith("Kickoff within")][0].set_value(20).run()
+    assert not at.exception, at.exception
+    assert at.metric[0].value == "0" and at.metric[3].value == "0"
+    assert any("No cross-book arbs" in s.value for s in at.tabs[1].success)
 
 
 def test_props_tab_never_fetches_on_load(monkeypatch):

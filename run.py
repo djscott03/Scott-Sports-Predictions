@@ -18,7 +18,7 @@ Add --epa to use play-by-play EPA (NFL only, slower first download).
 import sys, json
 import pandas as pd
 from sharpmodel import SharpModel, summarize_backtest, load_nfl, load_cfb
-from sharpmodel.odds import fetch_odds, load_odds_csv, find_ev, best_lines
+from sharpmodel.odds import fetch_odds, load_odds_csv, find_ev, best_lines, within_hours
 from sharpmodel.middles import find_middles, game_fairs, prop_fairs
 
 pd.set_option("display.width", 200); pd.set_option("display.max_columns", 40)
@@ -38,13 +38,6 @@ def excluded_books():
         if b == "nonus": out += NON_US_BOOKS
         elif b: out.append(b)
     return out
-
-
-def within_hours(odds, hours):
-    """Keep lines whose game kicks off within `hours` (rows without a kickoff, e.g. a hand CSV, are kept)."""
-    if "commence" not in odds or not odds.commence.notna().any(): return odds
-    c, now = pd.to_datetime(odds.commence, utc=True, errors="coerce"), pd.Timestamp.now(tz="UTC")
-    return odds[c.isna() | ((c > now) & (c <= now + pd.Timedelta(hours=hours)))]
 
 
 def print_middles(mids, title, n=30):

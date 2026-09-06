@@ -103,9 +103,14 @@ tests/                     offline pytest (89 tests, ~7s; incl. AppTest smoke + 
   keeps one row per pair of numbers — the best-EV pairing — with the other book combinations in
   `n_alt` / `alt`; `exclude=` removes books as legs only (fairs are built by the caller from the
   full board, on purpose).
-- **Actions scan market-only by default** (`weight` input 0, `exclude` input `nonus`); the CLI
-  keeps the documented 0.25 / 0.30 defaults. The live board with the model on was model-vs-market,
-  which is not what the scanner is for.
+- **Actions and the dashboard scan market-only by default** (`weight` input 0 / sidebar blend 0,
+  `exclude` `nonus`, kickoff window 240 h); the CLI keeps the documented 0.25 / 0.30 blend defaults.
+  The live board with the model on was model-vs-market, which is not what the scanner is for.
+- **Dashboard performance.** `price_board` is `st.cache_data`-keyed on the sidebar settings plus
+  `fetched_at`, so slider changes are cache hits and only a new odds pull re-prices. `find_middles`
+  with `collapse=True` pairs the best-priced book per NUMBER (top 3 per side so a same-book clash falls
+  through), not every book x book: the full 272-game board prices in ~2 s instead of ~33 s. The first
+  Streamlit Cloud deploy (2026-09-06) sat on "running" for that half-minute — that is what this fixes.
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
 
 ## Verified state (2026-09-05, local .venv on python 3.9; CI uses 3.12)
@@ -168,7 +173,8 @@ tests/                     offline pytest (89 tests, ~7s; incl. AppTest smoke + 
   the raw frame and the board land in `session_state`, and a second `at.run()` makes no call.
 
 ## Backlog (owner's roadmap, rough priority)
-1. Add `ODDS_API_KEY` + `CFBD_API_KEY` as repo secrets; deploy app.py to Streamlit Cloud (DEPLOY.md)
+1. ~~Add secrets; deploy app.py to Streamlit Cloud~~ — DONE 2026-09-05/06: secrets set by the owner,
+   app live at scott-sports-predictions-dg3viypucz4nyba8clzscc.streamlit.app (auto-redeploys on push to main)
 2. Telegram/Discord alert on new +EV line (Option B in DEPLOY.md)
 3. ~~Run the same backtest on CFB~~ — DONE 2026-09-05 (50.4% ATS, see verified state); next
    is a CFB `ev`/middles scan, not ratings work

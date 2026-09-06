@@ -38,7 +38,6 @@ COLS = ["commence", "matchup", "market", "player", "type", "bet_a", "bet_b", "wi
         "miss_cost_pct", "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p",
         "stake_a_pct", "stake_b_pct", "same_book", "n_alt", "alt",
         "event_id", "book_a", "line_a", "price_a", "book_b", "line_b", "price_b"]      # machine columns last
-_ROW_COLS = [c for c in COLS if c not in ("n_alt", "alt")]                          # filled in by _collapse
 SIDE_A = {"home", "over", "yes"}          # side A wins when the number goes UP
 SIDE_B = {"away", "under", "no"}          # side B wins when it goes DOWN
 TYPES = ("arb", "arb+middle", "free_middle", "middle", "half_middle")
@@ -164,27 +163,6 @@ def _window_str(w: np.ndarray, suffix: str = "") -> str:
 
 
 # ---------------- the finder ----------------
-def _collapse(res: pd.DataFrame) -> pd.DataFrame:
-    """One row per pair of NUMBERS (event, market, player, line_a, line_b): the best-EV pairing of books, with the
-    other pairings at the same numbers folded into n_alt / alt ("B betus +167; B bovada +165"). One stale price
-    against 28 books is one opportunity, not 28 rows."""
-    res = res.assign(_pk=res.player.fillna("")).sort_values("ev_pct", ascending=False, kind="stable")
-    am = lambda p: f"{int(round(float(p))):+d}"
-    keep, n_alt, alt = [], [], []
-    for _, g in res.groupby(["event_id", "market", "_pk", "line_a", "line_b"], dropna=False, sort=False):
-        best, others = g.iloc[0], g.iloc[1:]
-        desc = []
-        for r in others.itertuples():
-            if r.book_a != best.book_a: desc.append(f"A {r.book_a} {am(r.price_a)}")
-            if r.book_b != best.book_b: desc.append(f"B {r.book_b} {am(r.price_b)}")
-        desc = list(dict.fromkeys(desc))                                           # dedupe, keep EV order
-        keep.append(best.name); n_alt.append(len(others))
-        alt.append("; ".join(desc[:4]) + (" ..." if len(desc) > 4 else ""))
-    out = res.loc[keep].drop(columns="_pk")
-    out["n_alt"], out["alt"] = n_alt, alt
-    return out
-
-
 def find_middles(odds: pd.DataFrame, fairs: pd.DataFrame, league: str = "nfl", min_ev: float = 0.0,
                  include_same_book: bool = False, exclude=None, collapse: bool = True) -> pd.DataFrame:
     """
@@ -231,35 +209,64 @@ def find_middles(odds: pd.DataFrame, fairs: pd.DataFrame, league: str = "nfl", m
         k, p = support_pmf(dist, mu, None if sd is None or pd.isna(sd) else float(sd))
         home, away = e.home.iloc[0], e.away.iloc[0]
         player = e.player.iloc[0] if "player" in e and pk else np.nan
-        for a in A.itertuples():
-            for b in B.itertuples():
-                same = a.book == b.book
-                if same and not include_same_book: continue
-                th = _thresholds(mk, dist, a.line, b.line)
-                if th is None or th[1] < th[0] - EPS: continue          # both-lose gap
-                r = price_pair(k, p, th[0], th[1], a.price, b.price)
-                window, half, miss = len(r["window"]) > 0, len(r["half"]) > 0, r["miss_cost"]
-                p_mid, win, wstr = r["p_middle"], r["win_both"], _window_str(r["window"])
-                if r["guaranteed"] > EPS: typ = "arb+middle" if window else "arb"
-                elif window: typ = "free_middle" if abs(r["guaranteed"]) <= EPS else "middle"
-                elif half:                                                # one leg wins, the other pushes
-                    typ, p_mid, win, wstr = "half_middle", r["p_half"], r["half_pay"], _window_str(r["half"], "p")
-                else: continue                                            # scalp: no window, can lose
-                rows.append(dict(
-                    commence=a.commence if "commence" in e else np.nan, matchup=f"{away} @ {home}", market=mk,
-                    player=player, type=typ,
-                    bet_a=_bet(mk, a.side, a.line, a.price, a.book, home, away, player),
-                    bet_b=_bet(mk, b.side, b.line, b.price, b.book, home, away, player),
-                    window=wstr, p_middle=p_mid, miss_cost_pct=100 * miss, win_both_pct=100 * win,
-                    ev_pct=100 * r["ev"], guaranteed_pct=100 * r["guaranteed"],
-                    breakeven_p=miss / (win + miss) if win + miss > 0 else np.nan,
-                    stake_a_pct=100 * r["stake_a"], stake_b_pct=100 * r["stake_b"], same_book=same,
-                    event_id=eid, book_a=a.book, line_a=a.line, price_a=a.price,
-                    book_b=b.book, line_b=b.line, price_b=b.price))
-    res = pd.DataFrame(rows, columns=_ROW_COLS)
+
+        def emit(a, b, same):
+            th = _thresholds(mk, dist, a.line, b.line)
+            if th is None or th[1] < th[0] - EPS: return None              # both-lose gap
+            r = price_pair(k, p, th[0], th[1], a.price, b.price)
+            window, half, miss = len(r["window"]) > 0, len(r["half"]) > 0, r["miss_cost"]
+            p_mid, win, wstr = r["p_middle"], r["win_both"], _window_str(r["window"])
+            if r["guaranteed"] > EPS: typ = "arb+middle" if window else "arb"
+            elif window: typ = "free_middle" if abs(r["guaranteed"]) <= EPS else "middle"
+            elif half:                                                    # one leg wins, the other pushes
+                typ, p_mid, win, wstr = "half_middle", r["p_half"], r["half_pay"], _window_str(r["half"], "p")
+            else: return None                                             # scalp: no window, can lose
+            return dict(
+                commence=a.commence if "commence" in e else np.nan, matchup=f"{away} @ {home}", market=mk,
+                player=player, type=typ,
+                bet_a=_bet(mk, a.side, a.line, a.price, a.book, home, away, player),
+                bet_b=_bet(mk, b.side, b.line, b.price, b.book, home, away, player),
+                window=wstr, p_middle=p_mid, miss_cost_pct=100 * miss, win_both_pct=100 * win,
+                ev_pct=100 * r["ev"], guaranteed_pct=100 * r["guaranteed"],
+                breakeven_p=miss / (win + miss) if win + miss > 0 else np.nan,
+                stake_a_pct=100 * r["stake_a"], stake_b_pct=100 * r["stake_b"], same_book=same, n_alt=0, alt="",
+                event_id=eid, book_a=a.book, line_a=a.line, price_a=a.price,
+                book_b=b.book, line_b=b.line, price_b=b.price)
+
+        if not collapse:                                                  # every book pairing
+            for a in A.itertuples():
+                for b in B.itertuples():
+                    same = a.book == b.book
+                    if same and not include_same_book: continue
+                    row = emit(a, b, same)
+                    if row: rows.append(row)
+            continue
+        # collapse: one row per pair of NUMBERS. EV is monotone in each leg's price, so the best pairing is the best
+        # price on each leg (the top 3 books per side are tried so a same-book clash falls through to the next);
+        # the other books at the same numbers are folded into n_alt / alt. 35 books x 35 books -> ~9 price_pair calls.
+        am = lambda x: f"{int(round(float(x))):+d}"
+        A = A.sort_values(["_dec", "book"], ascending=[False, True])
+        B = B.sort_values(["_dec", "book"], ascending=[False, True])
+        for la, ga in A.groupby("line", dropna=False, sort=False):
+            for lb, gb in B.groupby("line", dropna=False, sort=False):
+                th = _thresholds(mk, dist, la, lb)
+                if th is None or th[1] < th[0] - EPS: continue
+                cands = []
+                for a in ga.head(3).itertuples():
+                    for b in gb.head(3).itertuples():
+                        same = a.book == b.book
+                        if same and not include_same_book: continue
+                        row = emit(a, b, same)
+                        if row: cands.append(row)
+                if not cands: continue
+                row = max(cands, key=lambda x: x["ev_pct"])                # ties -> best-priced legs first
+                others = ([f"A {x.book} {am(x.price)}" for x in ga.itertuples() if x.book != row["book_a"]]
+                          + [f"B {x.book} {am(x.price)}" for x in gb.itertuples() if x.book != row["book_b"]])
+                row["n_alt"] = len(ga) * len(gb) - 1
+                row["alt"] = "; ".join(others[:4]) + (" ..." if len(others) > 4 else "")
+                rows.append(row)
+    res = pd.DataFrame(rows, columns=COLS)
     if res.empty: return pd.DataFrame(columns=COLS)
-    res = _collapse(res) if collapse else res.assign(n_alt=0, alt="")
-    res = res[COLS]
     res = res[(res.guaranteed_pct >= -EPS) | (res.ev_pct >= min_ev)]
     safe = res.guaranteed_pct >= -EPS                                    # cannot lose: arbs, free (half) middles
     res = res.assign(_o=np.where(safe, 0, 1), _k=np.where(safe, res.guaranteed_pct, res.ev_pct))

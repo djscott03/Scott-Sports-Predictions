@@ -41,6 +41,15 @@ NON_US_BOOKS = ["pinnacle", "marathonbet", "matchbook", "smarkets", "betfair_ex_
                 "livescorebet", "casumo", "betway", "sportsbet", "tab", "neds", "playup", "pointsbetau", "betr_au",
                 "bluebet", "topsport", "gtbets", "everygame"]
 
+
+def within_hours(odds: pd.DataFrame, hours: float) -> pd.DataFrame:
+    """Lines whose game kicks off within `hours` from now. The API posts the whole season (272 NFL games on the
+    first live pull) and far-future numbers are stale by nature; 240 h covers a Tue-Mon slate. Rows without a
+    kickoff (a hand-captured CSV) are kept."""
+    if "commence" not in odds or not odds.commence.notna().any(): return odds
+    c, now = pd.to_datetime(odds.commence, utc=True, errors="coerce"), pd.Timestamp.now(tz="UTC")
+    return odds[c.isna() | ((c > now) & (c <= now + pd.Timedelta(hours=hours)))]
+
 # Odds API player-prop market keys. Also exist (out of v1 scope): player_pass_attempts,
 # player_pass_completions, player_rush_attempts and *_alternate variants -- extend here.
 PROP_MARKETS_DEFAULT = ["player_pass_yds", "player_rush_yds", "player_reception_yds", "player_receptions"]

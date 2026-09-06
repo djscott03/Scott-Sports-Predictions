@@ -19,7 +19,7 @@ import pandas as pd
 import streamlit as st
 
 from sharpmodel import SharpModel, load_nfl, load_cfb, props
-from sharpmodel.odds import (fetch_odds, find_ev, best_lines, parse_odds_json, fetch_events, fetch_props,
+from sharpmodel.odds import (fetch_odds, find_ev, best_lines, parse_odds_json, fetch_events, fetch_props, within_hours,
                              estimate_prop_credits, PROP_MARKETS_DEFAULT, PROP_MARKETS_ALL)
 from sharpmodel.props import load_player_weeks, project_players, fit_dispersion, price_props
 from sharpmodel.middles import find_middles, game_fairs, prop_fairs
@@ -43,7 +43,12 @@ league = st.sidebar.radio("League", ["nfl", "cfb"], horizontal=True)
 season = st.sidebar.number_input("Season", 2020, 2030, 2026)
 week = st.sidebar.number_input("Week", 1, 22, 1)
 min_ev = st.sidebar.slider("Min EV %", 0.0, 8.0, 1.5, 0.5) / 100
-model_w = st.sidebar.slider("Model blend weight", 0.0, 0.6, 0.25, 0.05)
+model_w = st.sidebar.slider("Model blend weight", 0.0, 0.6, 0.0, 0.05,
+                            help="Share of the fair number that comes from the ratings model. 0 = sharp-book market "
+                                 "only, i.e. stale lines and middles. Above 0 the board fills with the model "
+                                 "disagreeing with every book at once, which is not a stale line.")
+hours = st.sidebar.number_input("Kickoff within (hours)", 1, 2000, 240,
+                                help="The API posts the whole season; 240 h = a full Tue-Mon slate.")
 markets = st.sidebar.multiselect("Markets", ["spreads", "totals", "ml"], ["spreads", "totals", "ml"])
 books_excl = st.sidebar.text_input("Exclude books (comma sep)", "nonus",
                                    help="Books you cannot bet at are dropped as +EV rows and as arb/middle legs but still "
@@ -78,6 +83,17 @@ def load_odds(league, season):
     if not ODDS_KEY:
         return pd.DataFrame(), time.time()
     return fetch_odds(league, api_key=ODDS_KEY, known_teams=known), time.time()
+
+@st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Pricing the board…")
+def price_board(league, season, week, model_w, min_ev, markets, excl, hours, fetched_at, model_fair):
+    """+EV rows and arbs/middles for the sidebar settings. Keyed on fetched_at so a fresh odds pull re-prices;
+    otherwise a slider change is a cache hit, not a 30 s recompute. Excluded books still anchor the fairs."""
+    odds, _ = load_odds(league, season)
+    odds = within_hours(odds[odds.market.isin(list(markets))], hours)
+    ev = find_ev(odds, league, model_fair=model_fair, model_weight=model_w, min_ev=min_ev)
+    if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)
+    mids = find_middles(odds, game_fairs(odds, league, model_fair, model_w), league, exclude=list(excl))
+    return odds, ev, mids
 
 @st.cache_data(ttl=60 * 30, show_spinner="Listing upcoming games (free endpoint)…")
 def load_events(league):
@@ -123,12 +139,12 @@ def middles_view(m):
 
 # -------- main --------
 odds, fetched_at = load_odds(league, season)
+has_odds = not odds.empty                                          # a key and a live pull; the window may still empty the board
 age = (time.time() - fetched_at) / 60
 st.title(f"{league.upper()} +EV board")
 if odds.empty:
     st.warning(NO_KEY)
 else:
-    odds = odds[odds.market.isin(markets)]                         # excluded books still anchor the fair numbers
     try:
         preds, ratings, mkt_ratings = model_card(league, season, week)
         model_fair = preds[["home", "away", "model_margin", "model_total"]]
@@ -136,19 +152,19 @@ else:
         preds, ratings, mkt_ratings, model_fair = None, None, None, None
         st.info(f"Model unavailable ({e}); showing pure market-vs-market EV.")
 
-    ev = find_ev(odds, league, model_fair=model_fair, model_weight=model_w, min_ev=min_ev)
-    if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)
-    mids = find_middles(odds, game_fairs(odds, league, model_fair, model_w), league, exclude=excl)
+    n_posted = odds.event_id.nunique()
+    odds, ev, mids = price_board(league, season, week, model_w, min_ev, tuple(markets), tuple(excl), int(hours),
+                                 fetched_at, model_fair)
 
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Games", odds.event_id.nunique())
+    c1.metric("Games", odds.event_id.nunique(), help=f"kicking off within {hours} h, of {n_posted} posted")
     c2.metric("Books", odds.book.nunique())
     c3.metric("+EV lines", len(ev))
     c4.metric("Arbs & middles", len(mids), help="cross-book pairs that cannot lose or are +EV to middle")
     c5.metric("Odds age", f"{age:.0f} min", help=f"Refreshes every {REFRESH_MIN} min")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["+EV plays", "Arbs & middles", "Best lines", "Model card", "Props"])
-if not odds.empty:
+if has_odds:
     with tab1:
         if len(ev):
             show = ev.copy()
