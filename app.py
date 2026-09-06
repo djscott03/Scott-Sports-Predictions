@@ -1,5 +1,6 @@
 """
-Live +EV dashboard.  Run locally:  streamlit run app.py
+Live +EV dashboard (tabs: +EV plays, arbs & middles, best lines, model card, props).
+Run locally:  streamlit run app.py
 Deploy free:  push repo to GitHub -> share.streamlit.io -> New app -> add secrets.
 
 Refresh strategy: odds are cached for REFRESH_MIN minutes and re-fetched on the
@@ -9,16 +10,19 @@ keep REFRESH_MIN >= 20 and only leave the tab open on game days.
 
 Player props (Props tab) are never fetched automatically: the per-event endpoint bills
 games x markets per scan, so the tab shows the estimate on the button and only spends
-credits on click. The result lives in session_state until the next scan.
+credits on click. The raw (billed) prices land in session_state the moment the call
+returns; the board is priced from there with the sidebar's blend weight and EV threshold,
+so a rerun or a failed projection can never discard paid-for data.
 """
 import os, time
 import pandas as pd
 import streamlit as st
 
 from sharpmodel import SharpModel, load_nfl, load_cfb, props
-from sharpmodel.odds import (fetch_odds, find_ev, best_lines, find_arbs, parse_odds_json, fetch_events, fetch_props,
+from sharpmodel.odds import (fetch_odds, find_ev, best_lines, parse_odds_json, fetch_events, fetch_props,
                              estimate_prop_credits, PROP_MARKETS_DEFAULT, PROP_MARKETS_ALL)
 from sharpmodel.props import load_player_weeks, project_players, fit_dispersion, price_props
+from sharpmodel.middles import find_middles, game_fairs, prop_fairs
 
 st.set_page_config(page_title="SharpModel Live", page_icon="🏈", layout="wide")
 
@@ -71,7 +75,8 @@ def load_odds(league, season):
 
 @st.cache_data(ttl=60 * 30, show_spinner="Listing upcoming games (free endpoint)…")
 def load_events(league):
-    return fetch_events(league, api_key=ODDS_KEY)
+    ev = fetch_events(league, api_key=ODDS_KEY)
+    return ev, ev.attrs.get("remaining"), time.time()          # credits left (for fetch_props' reserve check) + when
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner="Projecting players…")
 def props_projections(season, week):
@@ -86,6 +91,28 @@ def kickoff(s):
         return pd.to_datetime(s, errors="coerce", utc=True).dt.strftime("%a %H:%M UTC")
 
 NO_KEY = "No odds loaded. Add ODDS_API_KEY in Streamlit secrets (free at the-odds-api.com)."
+MID_COLS = ["commence", "matchup", "market", "player", "type", "bet_a", "bet_b", "window", "p_middle", "miss_cost_pct",
+            "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "stake_a_pct", "stake_b_pct"]
+MID_NAMES = {"bet_a": "leg A", "bet_b": "leg B", "p_middle": "middle %", "miss_cost_pct": "miss cost %",
+             "win_both_pct": "win both %", "ev_pct": "EV %", "guaranteed_pct": "guaranteed %",
+             "breakeven_p": "breakeven %", "stake_a_pct": "stake A %", "stake_b_pct": "stake B %"}
+MID_NOTE = ("Two legs at two books, stakes split so a miss (the sides split) costs the same either way; every % is of "
+            "the total stake. The middle lands when the number finishes inside the window and both legs cash "
+            "(win both %); miss cost % is what a miss loses; breakeven % is the middle probability that covers it and "
+            "middle % is the fair distribution's probability (NFL spreads and moneylines use the empirical key-number "
+            "margin distribution, so a 3 counts ~3x what a Normal says). arb / free_middle cannot lose; half_middle "
+            "wins one leg on the 'Np' number while the other pushes. Lines move within minutes: place the "
+            "worse-priced leg first, confirm it is accepted, then the other. Same-book pairs are excluded.")
+
+
+def middles_view(m):
+    show = m.copy()
+    show["commence"] = kickoff(show.commence)
+    for c in ("p_middle", "breakeven_p"): show[c] = (show[c] * 100).round(1)
+    for c in ("miss_cost_pct", "win_both_pct", "ev_pct", "guaranteed_pct", "stake_a_pct", "stake_b_pct"):
+        show[c] = show[c].round(2)
+    cols = [c for c in MID_COLS if c != "player" or show.player.notna().any()]
+    return show[cols].rename(columns=MID_NAMES)
 
 # -------- main --------
 odds, fetched_at = load_odds(league, season)
@@ -104,15 +131,16 @@ else:
         st.info(f"Model unavailable ({e}); showing pure market-vs-market EV.")
 
     ev = find_ev(odds, league, model_fair=model_fair, model_weight=model_w, min_ev=min_ev)
-    arbs = find_arbs(odds)
+    mids = find_middles(odds, game_fairs(odds, league, model_fair, model_w), league)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Games", odds.event_id.nunique())
     c2.metric("Books", odds.book.nunique())
     c3.metric("+EV lines", len(ev))
-    c4.metric("Odds age", f"{age:.0f} min", help=f"Refreshes every {REFRESH_MIN} min")
+    c4.metric("Arbs & middles", len(mids), help="cross-book pairs that cannot lose or are +EV to middle")
+    c5.metric("Odds age", f"{age:.0f} min", help=f"Refreshes every {REFRESH_MIN} min")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["+EV plays", "Arbs", "Best lines", "Model card", "Props"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["+EV plays", "Arbs & middles", "Best lines", "Model card", "Props"])
 if not odds.empty:
     with tab1:
         if len(ev):
@@ -131,8 +159,11 @@ if not odds.empty:
         else:
             st.success("Nothing above your EV threshold right now — that's normal on an efficient board.")
     with tab2:
-        st.dataframe(arbs.assign(profit_pct=lambda d: (d.profit_pct * 100).round(2)) if len(arbs) else
-                     pd.DataFrame({"status": ["no arbs"]}), width="stretch", hide_index=True)
+        if len(mids):
+            st.dataframe(middles_view(mids), width="stretch", hide_index=True)
+        else:
+            st.success("No cross-book arbs or +EV middles on the board right now.")
+        st.caption(MID_NOTE)
     with tab3:
         st.dataframe(best_lines(odds), width="stretch", hide_index=True)
     with tab4:
@@ -153,9 +184,13 @@ with tab5:
         st.warning(NO_KEY)
     else:
         try:
-            events = load_events(league)
+            events, remaining, events_at = load_events(league)
         except Exception as e:
-            st.error(f"Events list failed: {e}"); events = pd.DataFrame(columns=["event_id", "commence", "home", "away"])
+            st.error(f"Events list failed: {e}")
+            events, remaining, events_at = pd.DataFrame(columns=["event_id", "commence", "home", "away"]), None, 0.0
+        scanned = st.session_state.get("props_odds")
+        if scanned and scanned.get("remaining") is not None and scanned["at"] > events_at:
+            remaining = scanned["remaining"]                   # the last billed call is fresher than the cached events call
         p_markets = st.multiselect("Prop markets", PROP_MARKETS_ALL, PROP_MARKETS_DEFAULT)
         pc1, pc2 = st.columns(2)
         hours = pc1.number_input("Hours ahead", 1, 240, 72, 12)
@@ -165,28 +200,45 @@ with tab5:
         cost = estimate_prop_credits(len(window), p_markets)
         st.caption(f"{len(window)} game(s) kick off within {int(hours)}h"
                    + (": " + ", ".join(f"{r.away}@{r.home}" for r in window.itertuples()) if len(window) else "")
-                   + f" — {len(window)} x {len(p_markets)} markets x 1 region = {cost} credits.")
+                   + f" — {len(window)} x {len(p_markets)} markets x 1 region = {cost} credits"
+                   + (f"; {remaining} left this month." if remaining is not None else "."))
         if st.button(f"Scan props (≈{cost} credits)", disabled=cost == 0):
             try:
                 with st.spinner("Pulling props (one call per game)…"):
-                    po = fetch_props(league, window.event_id, markets=p_markets, api_key=ODDS_KEY, max_credits=int(credits))
-                proj = None
+                    po = fetch_props(league, window, markets=p_markets, api_key=ODDS_KEY, max_credits=int(credits),
+                                     remaining=remaining)
+                labels = dict(zip(window.event_id, window.away + "@" + window.home))
+                # billed data lands in session_state first; projections/pricing below can fail without losing it
+                st.session_state["props_odds"] = dict(odds=po, at=time.time(),
+                                                      failed=[labels.get(i, i) for i in po.attrs.get("failed", [])],
+                                                      remaining=po.attrs.get("remaining"))   # last response's header
+                if "props" in st.session_state: del st.session_state["props"]
+            except Exception as e:
+                st.error(str(e))
+        raw = st.session_state.get("props_odds")
+        if raw is None:
+            st.info("Nothing scanned yet. Pick markets and a window, check the credit estimate on the button, then scan.")
+        else:
+            po = raw["odds"]
+            if raw["failed"]:
+                st.warning(f"{len(raw['failed'])} game(s) missing after Odds API errors (see server log): "
+                           + ", ".join(raw["failed"]))
+            key = (int(season), int(week), float(model_w), float(min_ev))
+            board = st.session_state.get("props")
+            if board is None or board["key"] != key:                 # price from session_state; re-price on slider change
+                proj, note = None, None
                 try:
                     proj, cv = props_projections(season, week); props._CV.update(cv)
                 except Exception as e:
-                    st.info(f"Projections unavailable ({e}); pricing market-only.")
-                st.session_state["props"] = dict(ev=price_props(po, proj, model_weight=0.30, min_ev=-1.0), at=time.time(),
-                                                 games=po.event_id.nunique(), books=po.book.nunique(), prices=len(po))
-            except Exception as e:
-                st.error(str(e))
-        res = st.session_state.get("props")
-        if res is None:
-            st.info("Nothing scanned yet. Pick markets and a window, check the credit estimate on the button, then scan.")
-        else:
-            pev = res["ev"]
-            pev = pev[pev.ev_pct >= min_ev] if len(pev) else pev
+                    note = f"Projections unavailable ({e}); pricing market-only."
+                board = dict(ev=price_props(po, proj, model_weight=model_w, min_ev=min_ev), key=key, note=note)
+                full = price_props(po, proj, model_weight=model_w, min_ev=-1.0)   # every two-way market -> fairs
+                board["mid"] = find_middles(po, prop_fairs(full), "nfl")
+                st.session_state["props"] = board
+            if board["note"]: st.info(board["note"])
+            pev = board["ev"]
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Games", res["games"]); m2.metric("Books", res["books"]); m3.metric("Prop prices", res["prices"])
+            m1.metric("Games", po.event_id.nunique()); m2.metric("Books", po.book.nunique()); m3.metric("Prop prices", len(po))
             m4.metric("+EV props", len(pev), help="above the sidebar Min EV %")
             if len(pev):
                 show = pev.copy()
@@ -203,11 +255,19 @@ with tab5:
                              width="stretch", hide_index=True)
             else:
                 st.success("Nothing above your EV threshold in the last scan.")
-            st.caption(f"Scanned {pd.Timestamp.fromtimestamp(res['at']).strftime('%H:%M:%S')} server time; the board stays "
+            st.subheader("Prop arbs & middles")
+            pm = board.get("mid")
+            if pm is not None and len(pm):
+                st.dataframe(middles_view(pm), width="stretch", hide_index=True)
+                st.caption(MID_NOTE + " Prop limits are low.")
+            else:
+                st.caption("No cross-book prop arbs or +EV middles in the last scan. " + MID_NOTE)
+            st.caption(f"Scanned {pd.Timestamp.fromtimestamp(raw['at']).strftime('%H:%M:%S')} server time; the board stays "
                        "until you scan again. Quota: each scan bills games x markets x regions credits from the free "
                        "500/month Odds API tier (the ≈N on the button), on top of the main board's 1 per refresh. "
-                       "Fair = 70/30 devigged market consensus / projection; stakes are quarter-Kelly capped at 2%. "
-                       "'no_market' rows have no two-way market behind them and are never staked; 'no_proj' rows are "
+                       f"Fair = {1 - model_w:.0%}/{model_w:.0%} devigged market consensus / projection (sidebar blend "
+                       "weight); stakes are quarter-Kelly capped at 2%. 'no_market' rows have no two-way market behind "
+                       "them: no EV, never staked, listed last. 'team_mismatch' rows are staked 0; 'no_proj' rows are "
                        "priced market-only. Props limits are low and books limit winners.")
 
 st.caption(f"Last odds pull: {pd.Timestamp.fromtimestamp(fetched_at).strftime('%Y-%m-%d %H:%M:%S')} server time. "

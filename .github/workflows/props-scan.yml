@@ -36,20 +36,31 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install -r requirements.txt
+      # inputs are free text: pass them through env vars, quoted, never interpolated into the shell
       - name: scan props
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SEASON: ${{ inputs.season }}
+          WEEK: ${{ inputs.week }}
+          MARKETS: ${{ inputs.markets }}
+          HOURS: ${{ inputs.hours }}
+          CREDITS: ${{ inputs.credits }}
         run: |
-          python run.py nfl props ${{ inputs.season }} ${{ inputs.week }} \
-            --markets ${{ inputs.markets }} --hours ${{ inputs.hours }} --credits ${{ inputs.credits }}
+          python run.py nfl props "$SEASON" "$WEEK" \
+            --markets "$MARKETS" --hours "$HOURS" --credits "$CREDITS"
       - name: job summary
+        env:
+          SEASON: ${{ inputs.season }}
+          WEEK: ${{ inputs.week }}
         run: |
           python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import os
           import pandas as pd
-          d = pd.read_csv("props_nfl_${{ inputs.season }}_w${{ inputs.week }}.csv").head(25)
+          season, week = os.environ["SEASON"].strip(), os.environ["WEEK"].strip()
+          d = pd.read_csv(f"props_nfl_{season}_w{week}.csv").head(25)
           cols = ["matchup", "market", "player", "side", "line", "price", "book", "n_books", "market_mu",
                   "proj_mean", "fair_mu", "fair_price", "ev_pct", "kelly_stake", "flags"]
-          print(f"## props scan ${{ inputs.season }} w${{ inputs.week }} — top {len(d)} by EV\n")
+          print(f"## props scan {season} w{week} — top {len(d)} by EV\n")
           if len(d):
               d = d[cols].round(3).fillna("")
               print("| " + " | ".join(cols) + " |"); print("|" + "---|" * len(cols))

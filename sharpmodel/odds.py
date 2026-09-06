@@ -62,16 +62,50 @@ def normalize_team(name: str, league: str, known: list[str] | None = None) -> st
 
 
 # ---------------- ingestion ----------------
-def fetch_odds(league: str, api_key: str | None = None, regions="us,us2,eu",
-               markets="h2h,spreads,totals", known_teams: list[str] | None = None) -> pd.DataFrame:
-    """Long format: event_id, commence, home, away, book, market, side, line, price."""
-    import requests
+class OddsAPIError(RuntimeError):
+    """A failed Odds API call. `status` is the HTTP status (None for timeouts / connection errors).
+    The message carries the status and the response body only -- never the URL, which holds the key."""
+    def __init__(self, status, body: str = ""):
+        self.status = status
+        super().__init__(f"Odds API {status or 'request'} error: {body}")
+
+
+def _key(api_key: str | None) -> str:
     key = api_key or os.environ.get("ODDS_API_KEY")
     if not key:
         raise RuntimeError("Set ODDS_API_KEY (free tier at the-odds-api.com)")
-    r = requests.get(ODDS_API.format(sport=SPORT_KEY[league]),
-                     params={"apiKey": key, "regions": regions, "markets": markets, "oddsFormat": "american"})
-    r.raise_for_status()
+    return key
+
+
+def _get(url: str, params: dict, timeout: int = 30):
+    """requests.get + raise_for_status. Any requests failure is re-raised as OddsAPIError so the key
+    (a query param, hence in every requests exception message) can never reach a log or the UI."""
+    import requests
+    try:
+        r = requests.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r
+    except requests.RequestException as e:
+        resp = getattr(e, "response", None)
+        body = str(getattr(resp, "text", "") or "")[:200] if resp is not None else type(e).__name__
+        key = params.get("apiKey")
+        if key: body = body.replace(key, "***")
+        raise OddsAPIError(getattr(resp, "status_code", None), body) from None
+
+
+def _remaining(r) -> int | None:
+    rem = r.headers.get("x-requests-remaining")
+    try:
+        return int(float(rem)) if rem is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_odds(league: str, api_key: str | None = None, regions="us,us2,eu",
+               markets="h2h,spreads,totals", known_teams: list[str] | None = None) -> pd.DataFrame:
+    """Long format: event_id, commence, home, away, book, market, side, line, price."""
+    r = _get(ODDS_API.format(sport=SPORT_KEY[league]),
+             {"apiKey": _key(api_key), "regions": regions, "markets": markets, "oddsFormat": "american"})
     print(f"[odds] requests remaining this month: {r.headers.get('x-requests-remaining')}")
     return parse_odds_json(r.json(), league, known_teams)
 
@@ -106,18 +140,15 @@ def load_odds_csv(path: str) -> pd.DataFrame:
 
 # ---------------- player props ----------------
 def fetch_events(league: str, api_key: str | None = None, known_teams: list[str] | None = None) -> pd.DataFrame:
-    """Upcoming events from the FREE endpoint (0 credits): event_id, commence (UTC), home, away."""
-    import requests
-    key = api_key or os.environ.get("ODDS_API_KEY")
-    if not key:
-        raise RuntimeError("Set ODDS_API_KEY (free tier at the-odds-api.com)")
-    r = requests.get(EVENTS_API.format(sport=SPORT_KEY[league]), params={"apiKey": key}, timeout=30)
-    r.raise_for_status()
+    """Upcoming events from the FREE endpoint (0 credits): event_id, commence (UTC), home, away.
+    df.attrs['remaining'] = x-requests-remaining (None if the header is absent) -- pass it to fetch_props."""
+    r = _get(EVENTS_API.format(sport=SPORT_KEY[league]), {"apiKey": _key(api_key)})
     rows = [dict(event_id=ev["id"], commence=ev["commence_time"],
                  home=normalize_team(ev["home_team"], league, known_teams),
                  away=normalize_team(ev["away_team"], league, known_teams)) for ev in r.json()]
     df = pd.DataFrame(rows, columns=["event_id", "commence", "home", "away"])
     df["commence"] = pd.to_datetime(df.commence, utc=True)
+    df.attrs["remaining"] = _remaining(r)
     return df
 
 
@@ -127,43 +158,83 @@ def estimate_prop_credits(n_events: int, markets, regions: str = "us") -> int:
     return int(n_events) * len(markets) * len(regions.split(","))
 
 
-def fetch_props(league: str, event_ids, markets=PROP_MARKETS_DEFAULT, regions: str = "us",
+STOP_STATUSES = (401, 402, 429)     # bad key / out of credits / rate-limited: retrying the next event is pointless
+MAX_TRANSPORT_FAILURES = 2          # consecutive timeouts / connection errors (status None) before giving up
+
+
+def fetch_props(league: str, events, markets=PROP_MARKETS_DEFAULT, regions: str = "us",
                 api_key: str | None = None, max_credits: int = 60, reserve: int = 50,
-                known_teams: list[str] | None = None) -> pd.DataFrame:
+                known_teams: list[str] | None = None, remaining: int | None = None) -> pd.DataFrame:
     """
-    Player props for the given event_ids (from fetch_events), one per-event call each.
-    Quota-aware: refuses up front if the estimate exceeds max_credits, and stops early once
-    x-requests-remaining drops below `reserve`. Long format: PROP_COLS.
+    Player props for the given events, one per-event call each. `events` is the fetch_events frame
+    (its home/away label the log lines; its attrs['remaining'] is the default `remaining`) or a plain
+    iterable of event ids. Long format: PROP_COLS.
+    Quota-aware: refuses up front if the estimate exceeds max_credits or if `remaining` minus one call's
+    cost would already breach `reserve`, and stops early once x-requests-remaining drops below `reserve`.
+    A failed per-event call is skipped (printed as '[props] skip away@home: status') so the events
+    already billed are kept; 401/402/429 stop the loop instead, and so do MAX_TRANSPORT_FAILURES
+    consecutive timeouts / connection errors. A 200 whose body is not the documented shape is skipped
+    too ('bad response body'). Skipped and never-attempted ids are returned in df.attrs['failed'];
+    df.attrs['remaining'] is x-requests-remaining from the last response (None if absent / no call).
+    If no event succeeded at all the last error is raised (nothing usable was billed).
     """
-    import requests
-    key = api_key or os.environ.get("ODDS_API_KEY")
-    if not key:
-        raise RuntimeError("Set ODDS_API_KEY (free tier at the-odds-api.com)")
-    event_ids, markets = list(event_ids), list(markets)
+    key = _key(api_key)
+    if isinstance(events, pd.DataFrame):
+        labels = {r.event_id: f"{r.away}@{r.home}" for r in events.itertuples()}
+        event_ids = list(events.event_id)
+        if remaining is None: remaining = events.attrs.get("remaining")
+    else:
+        labels, event_ids = {}, list(events)
+    markets = list(markets)
     n_reg = len(regions.split(","))
+    per_call = len(markets) * n_reg
     cost = estimate_prop_credits(len(event_ids), markets, regions)
     if cost > max_credits:
         raise RuntimeError(
             f"[props] {len(event_ids)} events x {len(markets)} markets x {n_reg} region(s) = {cost} credits "
-            f"> max_credits={max_credits}. Drop to <= {max_credits // (len(markets) * n_reg)} events, "
+            f"> max_credits={max_credits}. Drop to <= {max_credits // per_call} events, "
             f"or <= {max_credits // (len(event_ids) * n_reg)} markets, or raise max_credits.")
-    frames = []
-    for eid in event_ids:
-        r = requests.get(PROPS_API.format(sport=SPORT_KEY[league], event_id=eid),
-                         params={"apiKey": key, "regions": regions, "markets": ",".join(markets),
-                                 "oddsFormat": "american"}, timeout=30)
-        r.raise_for_status()
-        ev = r.json()
-        frames.append(parse_props_json(ev, league, known_teams))
-        last, rem = r.headers.get("x-requests-last"), r.headers.get("x-requests-remaining")
-        print(f"[props] {normalize_team(ev['away_team'], league, known_teams)}@"
-              f"{normalize_team(ev['home_team'], league, known_teams)}: cost {last}, remaining {rem}")
-        if rem is not None and float(rem) < reserve:
+    if remaining is not None and event_ids and remaining - per_call < reserve:
+        raise RuntimeError(f"[props] {remaining} credits remaining - {per_call} per call < reserve={reserve}; "
+                           "not scanning (wait for the monthly reset or lower reserve)")
+    frames, failed, last_err, rem, n_transport = [], [], None, None, 0
+    for i, eid in enumerate(event_ids):
+        try:
+            r = _get(PROPS_API.format(sport=SPORT_KEY[league], event_id=eid),
+                     {"apiKey": key, "regions": regions, "markets": ",".join(markets), "oddsFormat": "american"})
+            ev = r.json()
+            frame = parse_props_json(ev, league, known_teams)
+        except OddsAPIError as e:
+            failed.append(eid); last_err = e
+            print(f"[props] skip {labels.get(eid, eid)}: {e.status or 'request error'}")
+            n_transport = n_transport + 1 if e.status is None else 0
+            if e.status in STOP_STATUSES or n_transport >= MAX_TRANSPORT_FAILURES:
+                print(f"[props] stopping: {e}" if e.status in STOP_STATUSES
+                      else f"[props] stopping: {n_transport} consecutive request errors")
+                failed += event_ids[i + 1:]                       # never attempted, so not on the board either
+                break
+            continue
+        except (ValueError, KeyError, TypeError) as e:            # a 200 whose body is not the documented shape
+            failed.append(eid); last_err = OddsAPIError(None, f"bad response body ({type(e).__name__})")
+            print(f"[props] skip {labels.get(eid, eid)}: bad response body")
+            continue
+        n_transport = 0
+        frames.append(frame)
+        last, rem = r.headers.get("x-requests-last"), _remaining(r)
+        label = labels.get(eid) or (f"{normalize_team(ev['away_team'], league, known_teams)}@"
+                                    f"{normalize_team(ev['home_team'], league, known_teams)}")
+        print(f"[props] {label}: cost {last}, remaining {rem}")
+        if rem is not None and rem < reserve:
             print(f"[props] WARNING: {rem} credits left < reserve={reserve}; stopping after "
                   f"{len(frames)}/{len(event_ids)} events")
             break
+    if not frames and last_err is not None:
+        raise last_err
     frames = [f for f in frames if len(f)]
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=PROP_COLS)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=PROP_COLS)
+    df.attrs["failed"] = failed
+    df.attrs["remaining"] = rem
+    return df
 
 
 def parse_props_json(event: dict, league: str, known_teams=None) -> pd.DataFrame:
@@ -176,20 +247,25 @@ def parse_props_json(event: dict, league: str, known_teams=None) -> pd.DataFrame
             for o in mk.get("outcomes") or []:
                 player, side = o.get("description"), PROP_SIDES.get(str(o.get("name", "")).lower())
                 if not player or side is None: continue
+                line = o.get("point")
                 rows.append(dict(event_id=event["id"], commence=event.get("commence_time"), home=home, away=away,
                                  book=bk["key"], market=mk["key"], player=player, side=side,
-                                 line=o.get("point", np.nan), price=o["price"], updated=mk.get("last_update")))
+                                 line=np.nan if line is None else line,          # explicit "point": null -> NaN
+                                 price=o["price"], updated=mk.get("last_update")))
     return pd.DataFrame(rows, columns=PROP_COLS)
 
 
 def load_props_csv(path: str) -> pd.DataFrame:
     """Same long schema, for props you capture by hand (see props_template.csv).
-    Required columns: home, away, book, market, player, side(over|under|yes|no), line, price"""
+    Required columns: home, away, book, market, player, side(over|under|yes|no), line, price.
+    Sides are stripped and lower-cased; anything outside PROP_SIDES raises ValueError."""
     df = pd.read_csv(path)
     need = ["home", "away", "book", "market", "player", "side", "line", "price"]
     missing = [c for c in need if c not in df]
     if missing: raise ValueError(f"props csv missing columns: {missing}")
-    df["side"] = df.side.str.lower()
+    df["side"] = df.side.astype(str).str.strip().str.lower()
+    unknown = sorted(set(df.side) - set(PROP_SIDES))
+    if unknown: raise ValueError(f"props csv: unknown side(s) {unknown}; allowed: {'/'.join(PROP_SIDES)}")
     if "event_id" not in df: df["event_id"] = df.home + "@" + df.away
     for c in ("commence", "updated"):
         if c not in df: df[c] = np.nan
@@ -245,27 +321,42 @@ def sharp_fair(event_odds: pd.DataFrame, league: str) -> dict:
     return out
 
 
+def blended_fair(event_odds: pd.DataFrame, league: str, model_fair: pd.DataFrame | None = None,
+                 model_weight: float = 0.25) -> dict:
+    """sharp_fair for one event, nudged toward the model: mu = (1-w)*sharp + w*model for the margin and
+    the total, the ML mu shifted by the same margin nudge. model_fair: df with home, away, model_margin,
+    model_total (or that df already indexed by [home, away]); None or a missing game -> pure sharp fair.
+    find_ev and middles.game_fairs both price off exactly this dict."""
+    f = sharp_fair(event_odds, league)
+    if model_fair is None: return f
+    mf = model_fair if isinstance(model_fair.index, pd.MultiIndex) else model_fair.set_index(["home", "away"])
+    home, away = event_odds.home.iloc[0], event_odds.away.iloc[0]
+    if (home, away) not in mf.index: return f
+    mm, mt = mf.loc[(home, away), ["model_margin", "model_total"]]
+    out = dict(f)
+    if np.isfinite(f["mu_margin"]) and np.isfinite(mm):
+        out["mu_margin"] = (1 - model_weight) * f["mu_margin"] + model_weight * mm
+        out["mu_ml"] = f["mu_ml"] + (out["mu_margin"] - f["mu_margin"])     # shift ML mu by the same model nudge
+    if np.isfinite(f["mu_total"]) and np.isfinite(mt):
+        out["mu_total"] = (1 - model_weight) * f["mu_total"] + model_weight * mt
+    return out
+
+
 def find_ev(odds: pd.DataFrame, league: str, model_fair: pd.DataFrame | None = None,
             model_weight: float = 0.25, min_ev: float = 0.02, kelly_fraction: float = 0.25,
             max_stake: float = 0.03) -> pd.DataFrame:
     """
     Price every posted line against the fair mu and return +EV plays.
     model_fair: optional df with home, away, model_margin, model_total from SharpModel;
-                blended into the sharp mu with weight `model_weight`.
+                blended into the sharp mu with weight `model_weight` (blended_fair).
     """
     sd_s, sd_t = LEAGUE_SD[league]["spread"], LEAGUE_SD[league]["total"]
     mf = model_fair.set_index(["home", "away"]) if model_fair is not None else None
     rows = []
     for eid, e in odds.groupby("event_id"):
         home, away = e.home.iloc[0], e.away.iloc[0]
-        f = sharp_fair(e, league)
+        f = blended_fair(e, league, mf, model_weight)
         mu_m, mu_t, mu_ml = f["mu_margin"], f["mu_total"], f["mu_ml"]
-        if mf is not None and (home, away) in mf.index:
-            mm, mt = mf.loc[(home, away), ["model_margin", "model_total"]]
-            if np.isfinite(mu_m) and np.isfinite(mm):
-                mu_m = (1 - model_weight) * mu_m + model_weight * mm
-                mu_ml = mu_ml + (mu_m - f["mu_margin"])     # shift ML mu by the same model nudge
-            if np.isfinite(mu_t) and np.isfinite(mt): mu_t = (1 - model_weight) * mu_t + model_weight * mt
         for _, o in e.iterrows():
             if o.market == "spreads" and np.isfinite(mu_m):
                 home_line = o.line if o.side == "home" else -o.line
@@ -298,14 +389,17 @@ def _fair_american(p_win, p_push):
 
 
 def best_lines(odds: pd.DataFrame) -> pd.DataFrame:
-    """Best available price per matchup / market / side / line (the line-shopping board)."""
-    o = odds.copy(); o["dec"] = o.price.apply(decimal_from_american)
+    """Best available price per matchup / market / side / line (the line-shopping board).
+    Rows without a price (a blank in a hand-captured CSV) are dropped: idxmax cannot pick one."""
+    o = odds.reset_index(drop=True); o["dec"] = pd.to_numeric(o.price, errors="coerce").map(decimal_from_american)
+    o = o[o.dec.notna()]
     idx = o.groupby(["event_id", "market", "side", "line"], dropna=False).dec.idxmax()
     return o.loc[idx, ["home", "away", "market", "side", "line", "price", "book"]].reset_index(drop=True)
 
 
 def find_arbs(odds: pd.DataFrame) -> pd.DataFrame:
-    """Two-way arbs across books at the same number (spread/total) or moneyline."""
+    """Two-way arbs across books at the SAME number (spread/total) or moneyline. Kept for compatibility:
+    middles.find_middles supersedes it (different numbers too, middles priced off the fair pmf, stakes)."""
     out = []
     for (eid, mk), e in odds.groupby(["event_id", "market"]):
         a, b = ("over", "under") if mk == "totals" else ("home", "away")

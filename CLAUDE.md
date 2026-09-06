@@ -16,20 +16,37 @@ sharpmodel/ratings.py      weighted ridge power ratings (MarginModel) + off/def 
 sharpmodel/pricing.py      cover probs w/ push handling, devig, EV, fractional Kelly
 sharpmodel/adjustments.py  rest, wind/temp, QB-change flags, manual injury hook
 sharpmodel/engine.py       SharpModel.fit_as_of / price_games / predict_week / backtest, BetTracker (CLV)
-sharpmodel/odds.py         The Odds API (ODDS_API_KEY) + CSV ingest, sharp-book fair, find_ev, best_lines, find_arbs;
-                           player-prop ingest: fetch_events (free) -> estimate_prop_credits -> fetch_props (per event)
-sharpmodel/props.py        nflverse weekly player stats -> project_players (EW usage x opp x env), fit_dispersion,
-                           prop_probs / implied_mean (normal/poisson/bernoulli), price_props (devigged consensus, 70/30)
-run.py                     CLI: backtest | predict | ev | props
+sharpmodel/odds.py         The Odds API (ODDS_API_KEY) + CSV ingest, sharp_fair -> blended_fair (model nudge),
+                           find_ev, best_lines, find_arbs (legacy same-number arbs; middles.py supersedes it);
+                           every HTTP call goes through _get -> OddsAPIError (status + body, never the URL/key);
+                           player-prop ingest: fetch_events (free; attrs['remaining']) -> estimate_prop_credits ->
+                           fetch_props (per event; skips failed games, attrs['failed'], stops on 401/402/429)
+sharpmodel/margins.py      empirical NFL margin pmf: discretized Normal x key-number weights (NFL_KEY_WEIGHTS,
+                           fitted 1999-2025), margin_pmf / cover_probs_emp / moneyline_prob_emp; OPT-IN
+sharpmodel/middles.py      cross-book arbs & middles: game_fairs (blended_fair -> nfl_margin/normal) and
+                           prop_fairs (price_props board -> its dist/fair_mu/fair_sd) -> find_middles: every
+                           opposite-side pair at two books priced on the fair pmf's integer support; stakes
+                           split so a miss costs the same either way; types arb / arb+middle / free_middle /
+                           middle / half_middle, scalps dropped; *_pct columns are % of the TOTAL stake
+sharpmodel/props.py        nflverse weekly player stats -> project_players (EW usage x opp x env), fit_dispersion
+                           (starters only), prop_probs / implied_mean (normal/poisson/bernoulli), price_props
+                           (devigged consensus by normalised name, blend weight, rows carry event_id + dist + fair_sd)
+run.py                     CLI: backtest | predict | ev (+EV table, then ARBS & MIDDLES -> middles_*.csv) |
+                           props (--csv --markets --hours --credits --weight --nomodel; board, then PROP ARBS &
+                           MIDDLES -> props_middles_*.csv)
 holdout.py                 fit blend weight on early seasons, confirm on held-out ones
 publish_card.py            auto-detect week -> predictions/<league>/<season>_wNN.{md,csv} + graded README index
-app.py                     Streamlit dashboard (tabs: +EV, arbs, best lines, model card, props [button-gated])
+app.py                     Streamlit dashboard (tabs: +EV, arbs & middles, best lines, model card, props
+                           [button-gated; prop middles under the board])
 lines_template.csv         --csv schema for game lines;  props_template.csv  --csv schema for props (both tracked)
-tests/                     offline pytest (42 tests, ~2s; incl. AppTest smoke); conftest chdir's to repo root
+tests/                     offline pytest (88 tests, ~7s; incl. AppTest smoke + subprocess runs of run.py ev/props);
+                           conftest chdir's to repo root
 .github/workflows/ci.yml           pytest on push/PR (python 3.12)
 .github/workflows/weekly-card.yml  cron Tue+Thu 13:00 UTC + manual dispatch; commits predictions/
 .github/workflows/backtest.yml     manual dispatch; backtest -> job summary + csv artifact
 .github/workflows/props-scan.yml   manual dispatch ONLY (quota); run.py nfl props -> job summary + csv artifact
+.github/workflows/ev-scan.yml      manual dispatch ONLY (1 credit); run.py <league> ev -> +EV + arbs & middles
+                                   in the job summary + csv artifact; never commits
 ```
 
 ## Key design decisions (don't undo these)
@@ -50,16 +67,70 @@ tests/                     offline pytest (42 tests, ~2s; incl. AppTest smoke); 
   longest-prefix match against CFBD school names.
 - **Props are never fetched automatically.** The per-event endpoint bills games × markets ×
   regions per scan (vs 1 credit for the whole game-line board), so `fetch_props` refuses
-  above `max_credits` and stops under a 50-credit reserve; run.py prints the estimate first,
-  the Props tab shows it on the button and keeps the result in `session_state`, and
-  props-scan.yml is `workflow_dispatch` only. Do not add a cron or an auto-refresh.
-- Props pricing keeps the same prior: `fair_mu = 0.70*market_mu + 0.30*proj_mean`; a
-  projection with no two-way market behind it is flagged `no_market` and staked 0.
+  above `max_credits`, refuses up front when `remaining` (from the free events call) minus one
+  call would breach the 50-credit reserve, and stops under the reserve mid-scan; run.py prints
+  the estimate first, the Props tab shows it on the button, and props-scan.yml is
+  `workflow_dispatch` only. Do not add a cron or an auto-refresh.
+- **Billed data is never thrown away.** `fetch_props` keeps the games already fetched when a
+  later call fails (`attrs['failed']`, 401/402/429 stop the loop), and the Props tab stores the
+  raw frame in `session_state["props_odds"]` *before* projections/pricing run; the board is
+  priced from there (re-priced only when the sidebar weight / EV threshold / week change).
+- **The API key never reaches a log or the UI.** requests' exception messages embed the full
+  URL (`?apiKey=...`), so every call goes through `odds._get`, which re-raises as
+  `OddsAPIError("Odds API <status> error: <body>")`. Never print a raw requests exception.
+- Props pricing keeps the same prior: `fair_mu = (1-w)*market_mu + w*proj_mean`, `w` = 0.30
+  by default (`--weight`, sidebar slider). `no_market` rows (projection, no two-way market)
+  get ev_pct NaN and stake 0 and sort last; `team_mismatch` rows keep EV but stake 0.
+  Yes-only anytime-TD prices are power-devigged against a synthetic 'no' at a 7% hold
+  (capped at 98%: the steepest 'no' a book posts, else the power method zeroes longshots).
+- `fit_dispersion` fits cv on established starters only (>= 8 prior games, in the STARTERS
+  population). The sd still carries projection error, so EV% is a conservative ranking.
+- `price_props` rows carry `event_id`, `dist` and `fair_sd` (NaN for poisson/bernoulli) so
+  `middles.prop_fairs` can rebuild the distribution — keep them. Build the fairs from a board
+  priced with `min_ev=-1` (every two-way market), never from the +EV-filtered board alone.
+- **Two margin distributions, on purpose.** engine.py / pricing.py / find_ev still price the weekly
+  card and the +EV board off the plain Normal (sd 13.4): switching would re-price the frozen
+  `predictions/` record. `middles.py` prices NFL spreads/ML off `margins.margin_pmf` (empirical
+  key-number weights, sd 13.2) because a middle lives on single integers — 3 holds ~8% of the mass
+  where the Normal says ~3%. Totals, CFB and props stay Normal / Poisson. Don't "unify" them.
+- Middles: the market is still the prior (`game_fairs` = `blended_fair`, `prop_fairs` drops
+  `no_market` rows). Same-book pairs are excluded by default; scalps (no window, can lose) are
+  dropped; anything with `guaranteed_pct >= 0` (arbs, free middles) is always kept and sorted first.
+  `ev_pct` is the exact sum over every outcome (pushes included); the `window` / `p_middle` /
+  `win_both_pct` columns are the headline both-win numbers (a `half_middle` shows its push-win
+  number as `3p` and that outcome's payoff instead).
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
 
-## Verified state (2026-09-04, local .venv on python 3.9; CI uses 3.12)
-- `python -m pytest -q tests` → 42 passed (15 original + props projections/pricing, prop ingestion,
-  publish grading, holdout, dashboard AppTest with faked network).
+## Verified state (2026-09-05, local .venv on python 3.9; CI uses 3.12)
+- `python -m pytest -q tests` → 88 passed in ~7s (15 original + props projections/pricing,
+  prop ingestion + run.py subprocess runs, dashboard AppTest, publish grading, holdout,
+  `tests/test_margins.py`, `tests/test_middles.py` incl. a subprocess run of run.py ev + props;
+  the 2026-09-05 second review pass added 9: yes-only longshot bound, bad-body / transport-failure
+  handling in fetch_props, attrs['remaining'], duplicate-index and blank-price safety in
+  find_middles, empty-frame contract, tie mass).
+- CFB walk-forward backtest (GitHub Action `backtest.yml`, 2026-09-05, CFBD key, 2021–2025,
+  3,944 FBS games): MAE market 12.11 / model 14.22 / 65-35 blend 12.41; 1,600 flagged spread bets
+  **50.4% ATS, −3.7% flat ROI**; 219 totals 51.2%, −2.3%. The CFB ratings model is further from
+  the market than NFL's, and the min_edge threshold flags ~40% of games (a week-1 card had 32
+  plays in 51 games). CFB cards therefore stay manual-dispatch only; CFB edge must come from
+  odds.py / middles.py. LEAGUE_CFG was NOT re-tuned on this (in-sample).
+- 2026-09-05 arbs & middles (`middles.py`, all offline-tested): spread −2.5/+3.5 at −110 with fair 3
+  → window "3", p_middle = margin_pmf(3)[3] = .079, miss cost 4.55%, EV +3.0% ('middle'; the Normal
+  says −1.7%); +100/+100 → 'free_middle'; ML +120/−105 → 'arb' +3.4%; totals 44.5/46.5 → "45-46";
+  poisson receptions 4.5/6.5 → "5-6"; gap and same-book pairs skipped; −2.5/+3 → 'half_middle' "3p".
+  `run.py ev --csv lines_template.csv --nomodel` prints one 'middle' (pinnacle O 47.5 / fanduel
+  U 48.5, window 48, EV +0.5%) and writes `middles_nfl_2026_w1.csv`; `run.py props --csv
+  props_template.csv --nomodel` prints the Hurts 264.5/274.5 middle and writes
+  `props_middles_nfl_2026_w1.csv`. The Arbs & middles tab and the prop middles under the Props
+  board are exercised by AppTest with faked feeds.
+- 2026-09-05 props review fixes (all tested): key-safe `OddsAPIError`; per-event failure handling
+  with `attrs['failed']`; consensus grouped by `normalize_player`; `load_props_csv` validates sides;
+  Props tab stores the raw fetch in `session_state` before pricing and prices with the sidebar
+  weight; yes-only TD devig vs synthetic 'no'; `point: null` -> NaN and NaN lines skipped;
+  workflow inputs passed via env, `--markets` validated against `PROP_MARKETS_ALL`; `--weight`;
+  `--csv`/`--nomodel` load nothing from nflverse; `team_mismatch` staked 0; `no_market` ev NaN,
+  sorted last; reserve check before the first billed call; `dist` + `fair_sd` columns;
+  `fit_dispersion` on starters only.
 - `python run.py nfl backtest 2019 2025` → n=1960, MAE market 9.82 / model 10.29 / blend 9.86,
   323 spread bets 51.1% ATS −2.0% ROI, 36 totals 55.6% +6.1%.
 - `python run.py nfl predict 2026 1` prices the real Week 1 card from live nflverse lines.
@@ -69,22 +140,27 @@ tests/                     offline pytest (42 tests, ~2s; incl. AppTest smoke); 
 - `fetch_odds` has NOT been hit against the live Odds API yet (no key). First real call:
   sanity-check `parse_odds_json` field names against the v4 response (a unit test covers the
   documented shape).
-- Props: `python run.py nfl props 2026 1 --csv props_template.csv` runs end to end offline
-  (nflverse stats 2024–2025 load in ~1s, 2026 404s and is skipped, fitted cv pass 0.41 /
-  rush 0.69 / rec 0.72, 2 plays on the template's stale lines). `fetch_events` and the live
-  per-event props endpoint have NOT been hit yet (no key); `parse_props_json` is verified
-  only against the documented v4 shape. First real scan: use `--credits 10` on one game and
-  check the `x-requests-last` cost printed per call matches markets × regions.
-- Props tab verified with `AppTest` + a faked `requests.get`: page load makes no per-event
-  call, the button label carries the estimate, one click fetches once, reruns fetch nothing.
+- Props: `python run.py nfl props 2026 1 --csv props_template.csv` runs end to end
+  (nflverse stats 2024–2025 load in ~1s, 2026 404s and is skipped, 2 plays on the template's
+  stale lines). Fitted cv as of 2026 w1 with the starters-only fit: pass 0.35 (floor) / rush 0.62 /
+  rec 0.67, vs 0.42 / 0.77 / 0.81 when every player with >= 3 games was included (literature
+  ≈0.30 / 0.55 / 0.65). `fetch_events` and the live per-event props endpoint have NOT been hit
+  yet (no key); `parse_props_json` is verified only against the documented v4 shape. First real
+  scan: use `--credits 10` on one game and check the `x-requests-last` cost printed per call
+  matches markets × regions.
+- Props tab verified with `AppTest` + a faked `requests.get` (tests/test_app.py): page load makes
+  no per-event call, the button label carries the estimate, one click bills exactly one call,
+  the raw frame and the board land in `session_state`, and a second `at.run()` makes no call.
 
 ## Backlog (owner's roadmap, rough priority)
 1. Add `ODDS_API_KEY` + `CFBD_API_KEY` as repo secrets; deploy app.py to Streamlit Cloud (DEPLOY.md)
 2. Telegram/Discord alert on new +EV line (Option B in DEPLOY.md)
-3. Run the same backtest on CFB (needs CFBD_API_KEY)
+3. ~~Run the same backtest on CFB~~ — DONE 2026-09-05 (50.4% ATS, see verified state); next
+   is a CFB `ev`/middles scan, not ratings work
 4. QB starter-vs-backup point-value table; auto-apply instead of flag
 5. Opening-line capture → real CLV tracking via BetTracker
-6. Empirical key-number margin distribution to replace the Normal
+6. Empirical key-number margin distribution — DONE for middles (`margins.py`, unconditional
+   weights); still open: condition on the spread, and half-point buy/sell pricing on the card
 7. Derivatives (1H, team totals) off PointsModel
 
 ## Conventions

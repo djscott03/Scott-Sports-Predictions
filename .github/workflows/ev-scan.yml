@@ -1,0 +1,83 @@
+# Multi-book +EV scan (game lines: spreads / totals / moneylines) plus the cross-book
+# ARBS & MIDDLES pass on GitHub's runner. MANUAL ONLY -- never add a schedule: every run
+# bills 1 credit from the free 500/month Odds API tier (needs the ODDS_API_KEY repo secret;
+# league=cfb also needs CFBD_API_KEY for the team-name map). The tables land in the run's
+# job summary and the CSVs as a downloadable artifact; nothing is committed.
+name: ev scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "season, e.g. 2026"
+        default: "2026"
+      week:
+        description: "week number"
+        default: "1"
+      league:
+        description: "nfl or cfb"
+        default: "nfl"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # inputs are free text: pass them through env vars, quoted, never interpolated into the shell
+      - name: scan +EV lines, arbs & middles (1 credit)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
+          SEASON: ${{ inputs.season }}
+          WEEK: ${{ inputs.week }}
+          LEAGUE: ${{ inputs.league }}
+        run: |
+          python run.py "$LEAGUE" ev "$SEASON" "$WEEK"
+      - name: job summary
+        env:
+          SEASON: ${{ inputs.season }}
+          WEEK: ${{ inputs.week }}
+          LEAGUE: ${{ inputs.league }}
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import os
+          import pandas as pd
+          season, week, league = (os.environ[k].strip() for k in ("SEASON", "WEEK", "LEAGUE"))
+          def load(path):
+              try: return pd.read_csv(path)
+              except (FileNotFoundError, pd.errors.EmptyDataError): return pd.DataFrame()
+          def table(d, cols, n=25):
+              d = d[[c for c in cols if c in d]].head(n).round(3).fillna("")
+              print("| " + " | ".join(d.columns) + " |"); print("|" + "---|" * len(d.columns))
+              for r in d.itertuples(index=False): print("| " + " | ".join(str(v) for v in r) + " |")
+          ev = load(f"ev_{league}_{season}_w{week}.csv")
+          print(f"## {league} +EV scan {season} w{week} — top {min(len(ev), 25)} of {len(ev)} by EV\n")
+          if len(ev):
+              table(ev, ["matchup", "market", "team", "line", "price", "book", "ref_book", "fair_price", "p_win",
+                         "ev_pct", "kelly_stake"])
+          else:
+              print("no lines above the +1.5% EV threshold")
+          m = load(f"middles_{league}_{season}_w{week}.csv")
+          print(f"\n## arbs & middles — top {min(len(m), 25)} of {len(m)} (% of the total stake)\n")
+          if len(m):
+              table(m, ["type", "matchup", "market", "bet_a", "bet_b", "window", "p_middle", "miss_cost_pct",
+                        "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p"])
+          else:
+              print("no cross-book arbs or +EV middles")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ev-${{ inputs.league }}-${{ inputs.season }}-w${{ inputs.week }}
+          path: |
+            ev_*.csv
+            middles_*.csv
+            bestlines_*.csv
+            odds_*.csv

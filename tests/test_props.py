@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from sharpmodel import props
+from sharpmodel.pricing import devig, prob_to_american, american_to_prob
 from sharpmodel.props import (MARKETS, DEFAULT_CV, project_players, fit_dispersion, prop_probs,
                               implied_mean, price_props, normalize_player)
 
@@ -113,6 +114,29 @@ def test_fit_dispersion_floors_and_caches(league, monkeypatch):
     assert props._sd("player_pass_yds", 100.0) == pytest.approx(cv["player_pass_yds"] * 100)
 
 
+def _noisy_wr(n_games, hi=100.0):
+    """A T1 receiver alternating hi / 0 yards over the last n_games weeks of 2025: mean ~hi/2, huge residuals."""
+    return pd.DataFrame([dict(season=2025, week=w, season_type="REG", team="T1", opponent="T2", player_id="WRbk",
+                              player="Backup T1", position="WR", passing_yards=0.0, passing_tds=0, rushing_yards=0.0,
+                              rushing_tds=0, receiving_yards=0.0 if i % 2 else hi, receiving_tds=0, receptions=0)
+                         for i, w in enumerate(range(17 - n_games, 17))])
+
+
+def test_fit_dispersion_uses_established_starters_only(league, monkeypatch):
+    """Backups (few prior games, or outside the STARTERS population) add projection error, not variance."""
+    stats, _, _ = league
+    monkeypatch.setattr(props, "_CV", {})
+    fit = lambda st: fit_dispersion(st, as_of=(2025, 17), weeks=6, cv_floor=0.0)["player_reception_yds"]
+    base = fit(stats)
+    assert 0 < base < 0.35                                                    # 10% synthetic noise: below the floor
+    # < 8 prior games: out of the fit (he still nudges the shrink target the other projections use, hence rel)
+    assert fit(pd.concat([stats, _noisy_wr(5)], ignore_index=True)) == pytest.approx(base, rel=1e-3)
+    with_bk = pd.concat([stats, _noisy_wr(12)], ignore_index=True)
+    assert fit(with_bk) > 1.15 * base                       # 12 games and a WR96 population: counted as a starter
+    monkeypatch.setitem(props.STARTERS, "WR", 4)            # ...but with 4 starters per position he ranks 5th+ by usage
+    assert fit(with_bk) == pytest.approx(fit(stats))
+
+
 def test_prop_probs_and_implied_mean_round_trip():
     for dist, mean, sd, line in [("normal", 250.0, 80.0, 245.5), ("normal", 250.0, 80.0, 250.0),
                                  ("poisson", 2.3, None, 1.5), ("poisson", 2.3, None, 2.0)]:
@@ -175,13 +199,15 @@ def test_price_props_flags_stale_book_and_never_stakes_no_market():
     assert 244 < row.market_mu < 246 and row.proj_mean == 250.0
     assert row.fair_mu == pytest.approx(0.7 * row.market_mu + 0.3 * 250.0)
     assert row.ev_pct > 0.03 and 0 < row.kelly_stake <= 0.02 and row.fair_price < 0
+    assert row.dist == "normal" and row.fair_sd == pytest.approx(props._sd("player_pass_yds", row.fair_mu))
     assert not (res.book == "pinnacle").any()
-    # projection-only line: shown with the flag, EV computed, stake forced to 0
+    # projection-only line: shown with the flag (the price beats the projection), no EV, stake 0, listed last
     walker = res[res.player == "Kenneth Walker III"]
-    assert len(walker) == 1
+    assert len(walker) == 1 and res.index[-1] == walker.index[0]
     w = walker.iloc[0]
-    assert "no_market" in w["flags"] and "team_mismatch" in w["flags"] and w.kelly_stake == 0.0
+    assert "no_market" in w["flags"] and "team_mismatch" in w["flags"] and w.kelly_stake == 0.0 and np.isnan(w.ev_pct)
     assert np.isnan(w.market_mu) and w.fair_mu == 90.0 and w.n_books == 0 and w.team == "SEA"
+    assert w.fair_sd == pytest.approx(49.5) and w.p_win > 0.7                 # sd = 0.55 * 90; over 60.5 at +150
     # A.J. Brown matched AJ Brown exactly (same team) -> receptions priced off a blended poisson mean
     everything = price_props(_props_book(), _projections(), min_ev=-1.0)
     aj = everything[everything.player == "A.J. Brown"]
@@ -197,10 +223,89 @@ def test_price_props_flags_stale_book_and_never_stakes_no_market():
 def test_one_sided_anytime_td_pricing():
     res = price_props(_props_book(), _projections(), min_ev=-1.0)
     td = res[res.market == "player_anytime_td"]
-    assert len(td) == 3 and (td.n_books == 3).all()
-    p_med = 1.5 / 2.5 * (1 - 0.07)                                    # median of -150/-140/-160 is -150
-    assert td.market_mu.iloc[0] == pytest.approx(-np.log(1 - p_med))
+    assert len(td) == 3 and (td.n_books == 3).all() and (td.dist == "bernoulli").all() and td.fair_sd.isna().all()
+    # median of -150/-140/-160 is -150: power-devigged against a synthetic 'no' so the pair holds 7%, bounded by
+    # implied * (1 - hold) -- the bound is what binds for a favourite (the power method lets it keep more)
+    p_med = min(devig(-150, prob_to_american(1.07 - 0.6))[0], 0.6 * 0.93)
+    assert 0.55 < p_med < 0.57 and td.market_mu.iloc[0] == pytest.approx(-np.log(1 - p_med))
     assert (0 < td.p_win).all() and (td.p_win < 1).all()
     assert td.fair_mu.iloc[0] == pytest.approx(0.7 * td.market_mu.iloc[0] + 0.3 * 0.9)
     assert td.p_win.iloc[0] == pytest.approx(1 - np.exp(-td.fair_mu.iloc[0]))
     assert (td.kelly_stake <= 0.02).all()
+    # longshots take most of the vig (power method) but are never devigged to nothing: the synthetic 'no' is
+    # capped at MAX_SYNTH_NO, so +2000 keeps ~half its implied probability instead of ~4% of it
+    for price in (+300, +1000, +2000):
+        p = props._yes_only_prob(price, 0.07)
+        assert 0.25 * american_to_prob(price) < p < american_to_prob(price)
+    assert props._yes_only_prob(-150, 0.07) == pytest.approx(p_med)
+
+
+def test_yes_only_price_never_beats_itself():
+    """Past ~+4900 the MAX_SYNTH_NO cap turns the synthetic pair's hold negative and the power devig alone hands
+    the price MORE than its own implied probability (+10000 -> 1.75% vs 0.99% implied: +EV against itself)."""
+    ev = dict(event_id="e1", commence="2026-09-06T17:00:00Z", home="PHI", away="DAL")
+    lone = lambda price: pd.DataFrame([dict(ev, book="betmgm", market="player_anytime_td", player="Long Shot",
+                                            side="yes", line=np.nan, price=price)])
+    for price in (150, 1000, 5000, 10000, 20000):
+        implied = american_to_prob(price)
+        p = props._yes_only_prob(price, 0.07)
+        assert 0 < p < implied and p <= implied * 0.93 + 1e-12, price
+        market_p = 1 - np.exp(-price_props(lone(price), None, min_ev=-1.0).market_mu.iloc[0])    # the board's P(yes)
+        assert market_p == pytest.approx(p) and market_p < implied
+    res = price_props(lone(10000), None, min_ev=-1.0)
+    assert len(res) == 1 and res.iloc[0].ev_pct <= 0 and res.iloc[0].kelly_stake == 0
+    assert price_props(lone(10000), None, min_ev=0.0).empty                    # never shows up as a play
+
+
+def _two_way(ev, book, market, player, line, po, pu):
+    return [dict(ev, book=book, market=market, player=player, side="over", line=line, price=po),
+            dict(ev, book=book, market=market, player=player, side="under", line=line, price=pu)]
+
+
+def test_price_props_groups_by_normalized_name():
+    ev = dict(event_id="e1", commence="2026-09-06T17:00:00Z", home="PHI", away="DAL")
+    rows = (_two_way(ev, "pinnacle", "player_receptions", "A.J. Brown", 5.5, -115, -105)
+            + _two_way(ev, "draftkings", "player_receptions", "AJ Brown", 5.5, -110, -110))
+    res = price_props(pd.DataFrame(rows), _projections(), min_ev=-1.0)
+    assert len(res) == 4 and (res.n_books == 2).all() and set(res.player) == {"A.J. Brown"}   # first spelling seen
+    assert (res["flags"] == "").all() and (res.team == "PHI").all()
+
+
+def test_price_props_skips_lines_that_are_nan():
+    ev = dict(event_id="e1", commence="2026-09-06T17:00:00Z", home="PHI", away="DAL")
+    rows = (_two_way(ev, "draftkings", "player_pass_yds", "Jalen Hurts", 245.5, -110, -110)
+            + _two_way(ev, "betmgm", "player_pass_yds", "Jalen Hurts", np.nan, -110, -110))     # "point": null
+    res = price_props(pd.DataFrame(rows), None, min_ev=-1.0)
+    assert len(res) == 2 and set(res.book) == {"draftkings"} and (res.n_books == 1).all()
+    assert res.line.notna().all() and np.isfinite(res.market_mu).all()
+    only_nan = price_props(pd.DataFrame(rows[2:]), None, min_ev=-1.0)
+    assert only_nan.empty
+
+
+def test_team_mismatch_is_shown_but_never_staked():
+    ev = dict(event_id="e1", commence="2026-09-06T17:00:00Z", home="PHI", away="DAL")
+    rows = (_two_way(ev, "draftkings", "player_rush_yds", "Kenneth Walker III", 60.5, -110, -110)
+            + _two_way(ev, "fanduel", "player_rush_yds", "Kenneth Walker III", 50.5, -110, -110))   # stale
+    res = price_props(pd.DataFrame(rows), _projections(), min_ev=0.03)
+    # fair = 0.7 * 55.5 (median of the two books) + 0.3 * 90 (the SEA projection): both overs clear +3% EV
+    assert len(res) == 2 and (res["flags"] == "team_mismatch").all() and (res.side == "over").all()
+    r = res.iloc[0]
+    assert (r.book, r.line) == ("fanduel", 50.5) and r.ev_pct > res.ev_pct.iloc[1] > 0.03
+    assert (res.kelly_stake == 0.0).all() and (res.team == "SEA").all() and (res.n_books == 2).all()
+    assert res.fair_mu.iloc[0] == pytest.approx(0.7 * 55.5 + 0.3 * 90.0, abs=0.01)
+
+
+def test_no_market_rows_sort_last_and_filter_on_projection_ev():
+    ev = dict(event_id="e1", commence="2026-09-06T17:00:00Z", home="PHI", away="DAL")
+    rows = _two_way(ev, "draftkings", "player_pass_yds", "Jalen Hurts", 245.5, -110, -110)
+    rows.append(dict(ev, book="betmgm", market="player_receptions", player="AJ Brown", side="over", line=5.5, price=+100))
+    rows.append(dict(ev, book="betmgm", market="player_receptions", player="AJ Brown", side="under", line=9.5, price=-110))
+    res = price_props(pd.DataFrame(rows), _projections(), min_ev=-1.0)
+    assert list(res["flags"]) == ["", "", "no_market", "no_market"] and res.ev_pct.iloc[2:].isna().all()
+    assert list(res.ev_pct.iloc[:2]) == sorted(res.ev_pct.iloc[:2], reverse=True) and (res.kelly_stake.iloc[2:] == 0).all()
+    # projection 6.0 receptions: over 5.5 at +100 beats it, under 9.5 at -110 does too; under 5.5 at +100 would not
+    rows.append(dict(ev, book="fanduel", market="player_receptions", player="AJ Brown", side="under", line=5.5, price=+100))
+    kept = price_props(pd.DataFrame(rows), _projections(), min_ev=0.03)
+    nm = kept[kept["flags"] == "no_market"]
+    assert set(zip(nm.book, nm.side, nm.line)) == {("betmgm", "over", 5.5), ("betmgm", "under", 9.5)}
+    assert nm.ev_pct.isna().all() and (nm.kelly_stake == 0).all()

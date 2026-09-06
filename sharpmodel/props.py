@@ -13,7 +13,12 @@ Pipeline
      in at model_weight, price every posted line off that mean, rank by EV.
 
 Same rule as odds.py: the market is the prior. A projection with no two-way market
-behind it is shown with stake 0 and flagged 'no_market'.
+behind it is shown with stake 0, no EV and flagged 'no_market'.
+
+Dispersion caveat: the yardage sd is a cv fitted from walk-forward residuals of the projection
+(established starters only, see fit_dispersion), so it still carries projection error on top of
+true game-to-game variance. Priced around a market line that makes the tails a little fat and
+EV% a conservative *ranking* of stale numbers, not a calibrated edge.
 """
 from __future__ import annotations
 import re
@@ -88,8 +93,8 @@ def load_player_weeks(seasons: list[int]) -> pd.DataFrame:
 def _ew_project(sub: pd.DataFrame, x: np.ndarray, t: float, half_life: float,
                 prior_games: float, min_games: int) -> pd.DataFrame:
     """Per-player recency-weighted mean of x (rows before t), shrunk toward the position's starter mean
-    (top STARTERS[pos] players by that mean) with prior_games pseudo-games. Kish effective n, so the
-    decay sharpens memory without draining the sample."""
+    (top STARTERS[pos] players by that mean, flagged `starter`) with prior_games pseudo-games. Kish
+    effective n, so the decay sharpens memory without draining the sample."""
     w = 0.5 ** ((t - sub.game_index.values) / half_life)
     d = pd.DataFrame({"pid": sub.player_id.values, "pos": sub.position.values, "w": w, "wx": w * x, "w2": w * w})
     g = d.groupby("pid").agg(pos=("pos", "last"), w=("w", "sum"), wx=("wx", "sum"), w2=("w2", "sum"),
@@ -98,9 +103,10 @@ def _ew_project(sub: pd.DataFrame, x: np.ndarray, t: float, half_life: float,
     if g.empty: return g
     ew, n_eff = g.wx / g.w, g.w ** 2 / g.w2
     rank = ew.groupby(g.pos).rank(ascending=False, method="first")
-    reg = g[rank <= g.pos.map(STARTERS).fillna(np.inf)].groupby("pos")[["wx", "w"]].sum()
+    starter = rank <= g.pos.map(STARTERS).fillna(np.inf)
+    reg = g[starter].groupby("pos")[["wx", "w"]].sum()
     mu = (n_eff * ew + prior_games * g.pos.map(reg.wx / reg.w)) / (n_eff + prior_games)
-    return pd.DataFrame({"ew": ew, "n_eff": n_eff, "n_games": g.n_games, "mu": mu})
+    return pd.DataFrame({"ew": ew, "n_eff": n_eff, "n_games": g.n_games, "mu": mu, "starter": starter})
 
 
 def _opp_factors(sub: pd.DataFrame, x: np.ndarray, t: float, half_life: float) -> dict:
@@ -181,9 +187,14 @@ def project_players(stats: pd.DataFrame, games_this_week: pd.DataFrame, as_of: t
 
 
 def fit_dispersion(stats: pd.DataFrame, as_of: tuple | None = None, weeks: int = 17, half_life: float = 4.0,
-                   prior_games: float = 3.0, min_games: int = 3, cv_floor: float = 0.35) -> dict:
+                   prior_games: float = 3.0, min_games: int = 3, cv_floor: float = 0.35,
+                   min_fit_games: int = 8) -> dict:
     """Coefficient of variation per normal market from walk-forward residuals of the same EW projection
-    (cv^2 = sum resid^2 / sum proj^2 over the last `weeks` game-weeks before as_of). Cached in _CV."""
+    (cv^2 = sum resid^2 / sum proj^2 over the last `weeks` game-weeks before as_of). Fitted on established
+    starters only -- the STARTERS population with >= min_fit_games prior games -- because shrunk backups
+    and rookies add projection error that is not game-to-game variance and inflates the sd around a
+    market line (books price starters). Still includes the starters' own projection error, so it is an
+    upper bound on the true cv. Cached in _CV."""
     st = stats if "game_index" in stats else stats.assign(game_index=_game_index(stats))
     t_max = as_of[0] * WEEKS_PER_SEASON + as_of[1] if as_of else st.game_index.max() + 1
     acc = {mk: [0.0, 0.0] for mk, sp in MARKETS.items() if sp["dist"] == "normal"}
@@ -194,6 +205,8 @@ def fit_dispersion(stats: pd.DataFrame, as_of: tuple | None = None, weeks: int =
             sub, c = hist[hist.position.isin(sp["positions"])], cur[cur.position.isin(sp["positions"])]
             if sub.empty or c.empty: continue
             p = _ew_project(sub, _stat(sub, sp["stat"]), t, half_life, prior_games, min_games)
+            if p.empty: continue
+            p = p[p.starter & (p.n_games >= min_fit_games)]
             actual = pd.Series(_stat(c, sp["stat"]), index=c.player_id.values)
             both = actual.index.intersection(p.index)
             acc[mk][0] += float(((actual[both] - p.mu[both]) ** 2).sum()); acc[mk][1] += float((p.mu[both] ** 2).sum())
@@ -266,6 +279,19 @@ def _fair_american(p_win, p_push):
     return prob_to_american(p)
 
 
+MAX_SYNTH_NO = 0.98     # steepest 'no' a book posts (~ -4900); past it the synthetic pair would devig longshots to ~0
+
+
+def _yes_only_prob(yes_price: float, one_sided_hold: float) -> float:
+    """P(yes) from a yes-only price: power-devig against a synthetic 'no' priced so the pair holds
+    one_sided_hold (capped at MAX_SYNTH_NO). Longshots take most of the vig, as in a real two-way market.
+    Bounded by implied(yes) * (1 - hold): past ~+4900 the cap turns the pair's hold negative and the power
+    devig would hand a yes-only price MORE than its own implied probability, i.e. +EV against itself."""
+    p_yes = american_to_prob(yes_price)
+    p_no = float(np.clip(1 + one_sided_hold - p_yes, 1e-3, MAX_SYNTH_NO))
+    return min(devig(yes_price, prob_to_american(p_no))[0], p_yes * (1 - one_sided_hold))
+
+
 def price_props(props_odds: pd.DataFrame, projections: pd.DataFrame | None = None, model_weight: float = 0.30,
                 min_ev: float = 0.03, kelly_fraction: float = 0.25, max_stake: float = 0.02,
                 one_sided_hold: float = 0.07) -> pd.DataFrame:
@@ -273,16 +299,23 @@ def price_props(props_odds: pd.DataFrame, projections: pd.DataFrame | None = Non
     Price every posted prop line and return +EV plays, ranked.
     props_odds (long, from odds.parse_props_json): event_id, commence, home, away, book, market, player,
     side (over|under|yes|no), line, price.
-    Per (event, market, player): every book with a two-way pair is devigged and inverted -> market_mu
-    is the median (n_books). Yes-only markets: median implied P(yes) x (1 - one_sided_hold).
-    fair_mu = (1-model_weight)*market_mu + model_weight*proj_mean. No market_mu at all -> fair from the
-    projection, stake forced to 0 and flagged 'no_market' (projection-only numbers are never staked).
+    Per (event, market, normalize_player(player)) -- so 'A.J. Brown' and 'AJ Brown' are one player, shown
+    under the first spelling seen: every book with a two-way pair at the same number is devigged and
+    inverted -> market_mu is the median (n_books); over/under rows without a line are ignored. Yes-only
+    prices are devigged against a synthetic 'no' at one_sided_hold (_yes_only_prob).
+    fair_mu = (1-model_weight)*market_mu + model_weight*proj_mean, priced with fair_sd = cv * fair_mu
+    (normal markets; NaN for poisson/bernoulli) -- `event_id`, `dist` and `fair_sd` are returned per row so
+    the distribution can be rebuilt (middles.prop_fairs). No market_mu at all -> fair from the projection, flagged 'no_market',
+    ev_pct NaN and stake 0 (a projection alone is never a bet); such rows are kept when the price beats
+    the projection by min_ev and always sort last. 'team_mismatch' rows keep their EV but are staked 0:
+    the opponent/environment factors belong to the stale team.
     """
     proj, rows = _proj_index(projections), []
-    for (eid, mk, name), e in props_odds.groupby(["event_id", "market", "player"]):
+    po = props_odds.assign(_key=props_odds.player.map(normalize_player))
+    for (eid, mk, _k), e in po.groupby(["event_id", "market", "_key"]):
         if mk not in MARKETS: continue
         dist = MARKETS[mk]["dist"]
-        home, away = e.home.iloc[0], e.away.iloc[0]
+        home, away, name = e.home.iloc[0], e.away.iloc[0], e.player.iloc[0]
         pr, flags = _match(proj.get(mk), name, home, away)
         mus, books = [], set()
         for bk, b in e.groupby("book"):
@@ -290,10 +323,10 @@ def price_props(props_odds: pd.DataFrame, projections: pd.DataFrame | None = Non
                 yes, no = b[b.side.isin(["yes", "over"])], b[b.side.isin(["no", "under"])]
                 if yes.empty: continue
                 mus.append(devig(yes.price.iloc[0], no.price.iloc[0])[0] if len(no)
-                           else american_to_prob(yes.price.iloc[0]) * (1 - one_sided_hold))
+                           else _yes_only_prob(yes.price.iloc[0], one_sided_hold))
                 books.add(bk)
                 continue
-            for _, o in b[b.side == "over"].iterrows():
+            for _, o in b[(b.side == "over") & b.line.notna()].iterrows():
                 u = b[(b.side == "under") & np.isclose(b.line.astype(float), float(o.line))]
                 if len(u):
                     q, _ = devig(o.price, u.iloc[0].price)
@@ -307,17 +340,20 @@ def price_props(props_odds: pd.DataFrame, projections: pd.DataFrame | None = Non
             fair = proj_mean; flags = flags + ["no_market"]
         else:
             continue
+        no_market, unstaked = "no_market" in flags, ("no_market" in flags or "team_mismatch" in flags)
         sd = _sd(mk, fair)
         for _, o in e.iterrows():
             if dist != "bernoulli" and pd.isna(o.line): continue
             pp = prop_probs(dist, fair, sd, float(o.line) if pd.notna(o.line) else np.nan, o.side)
             ek = edge_and_kelly(pp["win"], pp["push"], o.price, kelly_fraction, max_stake)
-            rows.append(dict(commence=o.get("commence"), matchup=f"{away} @ {home}", market=mk, player=name,
+            if ek["ev"] < min_ev: continue                          # no_market rows: filtered on the projection's EV
+            rows.append(dict(event_id=eid, commence=o.get("commence"), matchup=f"{away} @ {home}", market=mk, player=name,
                              team=pr["team"] if pr is not None else np.nan, side=o.side, line=o.line,
                              price=o.price, book=o.book, n_books=len(books), market_mu=market_mu,
-                             proj_mean=proj_mean, fair_mu=fair, p_win=pp["win"],
-                             fair_price=_fair_american(pp["win"], pp["push"]), ev_pct=ek["ev"],
-                             kelly_stake=0.0 if "no_market" in flags else ek["stake_frac"], flags=";".join(flags)))
+                             proj_mean=proj_mean, fair_mu=fair, fair_sd=float(sd) if sd is not None else np.nan,
+                             dist=dist, p_win=pp["win"], fair_price=_fair_american(pp["win"], pp["push"]),
+                             ev_pct=np.nan if no_market else ek["ev"],
+                             kelly_stake=0.0 if unstaked else ek["stake_frac"], flags=";".join(flags)))
     res = pd.DataFrame(rows)
     if res.empty: return res
-    return res[res.ev_pct >= min_ev].sort_values("ev_pct", ascending=False).reset_index(drop=True)
+    return res.sort_values("ev_pct", ascending=False, na_position="last").reset_index(drop=True)
