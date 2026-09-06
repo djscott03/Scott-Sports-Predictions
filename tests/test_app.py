@@ -77,7 +77,7 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     assert any("Model unavailable" in i.value for i in at.info)
     tab = at.tabs[1]
     # sidebar default 'nonus': pinnacle still anchors the fair but cannot be a leg -> nothing to show
-    assert tab.label == "Arbs & middles" and len(tab.dataframe) == 0
+    assert tab.label == "Arbs & middles · 0" and len(tab.dataframe) == 0
     assert any("No cross-book arbs" in s.value for s in tab.success) and at.metric[3].value == "0"
     box = [t for t in at.text_input if t.label.startswith("Exclude books")][0]
     assert box.value == "nonus"
@@ -86,8 +86,8 @@ def test_arbs_and_middles_tab_shows_the_cross_book_middle(monkeypatch):
     tab = at.tabs[1]
     assert len(tab.dataframe) == 1
     view = tab.dataframe[0].value
-    assert list(view["leg A"]) == ["PHI -2.5 -110 @ pinnacle"] and list(view["leg B"]) == ["DAL +3.5 -110 @ fanduel"]
-    assert list(view["window"]) == ["3"] and list(view["type"]) == ["middle"] and "player" not in view.columns
+    assert list(view["leg A"]) == ["PHI -2.5 -110 @ Pinnacle"] and list(view["leg B"]) == ["DAL +3.5 -110 @ FanDuel"]
+    assert list(view["window"]) == ["3"] and list(view["type"]) == ["🎯 middle"] and "player" not in view.columns
     assert float(view["miss cost %"].iloc[0]) == 4.55 and 5 < float(view["middle %"].iloc[0]) < 10   # key-number pmf
     assert float(view["EV %"].iloc[0]) > 0 and any("worse-priced leg first" in c.value for c in tab.caption)
     assert [m.label for m in at.metric][:4] == ["Games", "Books", "+EV lines", "Arbs & middles"]

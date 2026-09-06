@@ -125,7 +125,9 @@ def fetch_odds(league: str, api_key: str | None = None, regions="us,us2,eu",
     r = _get(ODDS_API.format(sport=SPORT_KEY[league]),
              {"apiKey": _key(api_key), "regions": regions, "markets": markets, "oddsFormat": "american"})
     print(f"[odds] requests remaining this month: {r.headers.get('x-requests-remaining')}")
-    return parse_odds_json(r.json(), league, known_teams)
+    df = parse_odds_json(r.json(), league, known_teams)
+    df.attrs["remaining"] = _remaining(r)                       # an int, never a frame (pandas 3 compares attrs)
+    return df
 
 
 def parse_odds_json(events: list, league: str, known_teams=None) -> pd.DataFrame:

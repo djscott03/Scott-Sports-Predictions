@@ -1,0 +1,21 @@
+# Dashboard theme: Cleveland. Browns orange on dark brown, Cavs wine and gold as the accents.
+# Committed on purpose; secrets live in secrets.toml, which is gitignored.
+[theme]
+base = "dark"
+primaryColor = "#FF3C00"
+backgroundColor = "#0e0906"
+secondaryBackgroundColor = "#1a110c"
+textColor = "#f5efe9"
+linkColor = "#FDBB30"
+font = "sans-serif"
+baseRadius = "12px"
+borderColor = "#3b2a1f"
+showWidgetBorder = true
+dataframeBorderColor = "#3b2a1f"
+dataframeHeaderBackgroundColor = "#1a110c"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
