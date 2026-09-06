@@ -153,7 +153,7 @@ tests/                     offline pytest (89 tests, ~7s; incl. AppTest smoke + 
   produced 28 "arbs" -> `find_middles` now collapses to the best pairing per pair of numbers
   (`n_alt` / `alt`) and `--exclude nonus` (`odds.NON_US_BOOKS`) keeps EU/exchange books out of
   the legs and +EV rows while they still anchor the fairs; (3) the API returns the whole season,
-  so `ev` has `--hours` (default 168). Real prop middle seen live: T. Ferguson rec yds O 19.5 /
+  so `ev` has `--hours` (default 240 = a Tue-Mon slate; 168 from a Saturday missed Sunday). Real prop middle seen live: T. Ferguson rec yds O 19.5 /
   U 22.5 (window 20-22, +1.1%).
 - Props: `python run.py nfl props 2026 1 --csv props_template.csv` runs end to end
   (nflverse stats 2024–2025 load in ~1s, 2026 404s and is skipped, 2 plays on the template's

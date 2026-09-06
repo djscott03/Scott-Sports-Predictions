@@ -1,4 +1,5 @@
 """Dashboard smoke tests via streamlit's AppTest. No network: requests.get is faked or forbidden."""
+import os
 import pandas as pd
 import requests
 import streamlit as st
@@ -10,6 +11,8 @@ from sharpmodel.odds import ODDS_API, EVENTS_API, PROPS_API
 
 TABS = ["+EV plays", "Arbs & middles", "Best lines", "Model card", "Props"]
 NFL = "americanfootball_nfl"
+APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")   # streamlit >= 1.5x resolves
+                                                                                             # relative paths against this file
 
 
 class _Resp:
@@ -37,7 +40,7 @@ def _run(monkeypatch, key):
     st.cache_data.clear()                                   # st.cache_data is process-wide across AppTest runs
     if key: monkeypatch.setenv("ODDS_API_KEY", key)
     else: monkeypatch.delenv("ODDS_API_KEY", raising=False)
-    at = AppTest.from_file("app.py", default_timeout=120)
+    at = AppTest.from_file(APP, default_timeout=120)
     at.run()
     assert not at.exception, at.exception
     return at

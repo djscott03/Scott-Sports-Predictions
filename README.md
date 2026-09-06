@@ -83,11 +83,12 @@ export ODDS_API_KEY=...        # free tier at the-odds-api.com (500 req/mo; each
 python run.py nfl ev 2026 1                 # every US/EU book, spreads + totals + ML
 python run.py nfl ev 2026 1 --csv lines.csv # lines you captured yourself (see lines_template.csv)
 python run.py nfl ev 2026 1 --nomodel       # pure market-vs-market, no model blend (= --weight 0)
-python run.py nfl ev 2026 1 --hours 168 --exclude nonus   # games inside 7 days; no EU/exchange books as bets
+python run.py nfl ev 2026 1 --hours 240 --exclude nonus   # games inside 10 days (default); no EU/exchange books as bets
 ```
 
 `--hours` matters because the API posts the whole season (272 games on the first live
-run) and far-future numbers are stale by nature. `--exclude nonus` drops every EU/UK/AU
+run) and far-future numbers are stale by nature; 240 h covers a full Tuesday-to-Monday
+slate from a Tuesday scan (a Saturday scan with 168 h missed Sunday's games). `--exclude nonus` drops every EU/UK/AU
 book, the exchanges and Pinnacle from the *bettable* rows and legs — a US bettor can't
 get down there — while they still anchor the fair numbers (`--exclude a,b` also takes a
 plain list; the dashboard sidebar has the same box). `--weight` is the model's share of

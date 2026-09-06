@@ -6,7 +6,7 @@ Usage:
   python run.py nfl ev 2026 1                   # scan every book for +EV lines + cross-book arbs/middles (needs ODDS_API_KEY)
   python run.py nfl ev 2026 1 --csv lines.csv   # ...or from lines you captured yourself
   python run.py nfl ev 2026 1 --nomodel         # pure sharp-book devig, no model blend (same as --weight 0)
-  python run.py nfl ev 2026 1 --hours 168 --exclude nonus   # only games inside 7 days; no EU/exchange books as legs
+  python run.py nfl ev 2026 1 --hours 240 --exclude nonus   # only games inside 10 days (default); no EU/exchange books as legs
                                                 # (--exclude also takes a comma list of book keys; 'nonus' = odds.NON_US_BOOKS)
   python run.py nfl props 2026 1                # player props: free events list -> credit estimate -> per-event fetch
   python run.py nfl props 2026 1 --markets player_pass_yds,player_anytime_td --hours 48 --credits 30
@@ -91,7 +91,7 @@ elif mode == "predict":
 
 elif mode == "ev":
     season, week = args
-    csv, hours, excl = opt("--csv"), float(opt("--hours", 168)), excluded_books()
+    csv, hours, excl = opt("--csv"), float(opt("--hours", 240)), excluded_books()   # 10 days: Tue scan -> Mon night game
     weight = 0.0 if "--nomodel" in sys.argv else float(opt("--weight", 0.25))
     if not 0 <= weight <= 1: sys.exit("ev: --weight must be between 0 and 1")
     model_fair = None

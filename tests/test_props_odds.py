@@ -342,7 +342,7 @@ def test_fetch_events_free_endpoint(monkeypatch, capsys):
     assert calls[0][0] == EVENTS_API.format(sport="americanfootball_nfl") and calls[0][2] == 30
     assert list(df.columns) == ["event_id", "commence", "home", "away"]
     assert list(df.home) == ["PHI", "KC"] and list(df.away) == ["DAL", "LAC"]
-    assert str(df.commence.dtype) == "datetime64[ns, UTC]" and df.commence.iloc[0].hour == 17
+    assert str(df.commence.dt.tz) == "UTC" and df.commence.iloc[0].hour == 17      # tz-aware; ns or us resolution (pandas 3)
     assert df.attrs["remaining"] == 480 and df[df.home == "KC"].attrs["remaining"] == 480   # survives filtering
     assert capsys.readouterr().out == ""                                         # free call: no quota chatter
     monkeypatch.setattr(requests, "get", lambda *a, **k: _Resp([]))

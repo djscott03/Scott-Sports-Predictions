@@ -18,8 +18,8 @@ on:
         description: "nfl or cfb"
         default: "nfl"
       hours:
-        description: "only games kicking off within this many hours (the API posts the whole season)"
-        default: "168"
+        description: "only games kicking off within this many hours (the API posts the whole season); 240 = a full Tue-Mon week"
+        default: "240"
       exclude:
         description: "books that may not be a leg / +EV row: 'nonus' = EU/UK/AU/exchange keys + pinnacle, or a comma list"
         default: "nonus"
