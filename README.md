@@ -80,6 +80,12 @@ book), non-US books excluded as bets, games kicking off within 240 h. Changing a
 instant (the board is cached until the next odds pull); the Props tab spends nothing until you
 click its button.
 
+Tabs: **+EV plays** (one line per stale price), **Arbs & middles** (two-leg plays), **Odds
+screen** (one row per pick, one column per sportsbook, `number price` in each cell — the best
+price on the market's number is green, a book sitting on a *different* number is amber, which is
+where middles come from), **Model card**, **Props** (board, prop middles, prop odds screen).
+The CLI writes the same grid to `screen_*.csv` / `props_screen_*.csv`.
+
 ## Multi-book +EV scanner (`odds.py`)
 
 ```bash
@@ -110,8 +116,9 @@ How it prices a line:
    that same distribution, so a `-6.5 -110` and a `-7 +100` are compared as probabilities.
 5. Rank by EV%, size with quarter-Kelly. Arbs and middles are a separate pass (next section).
 
-Outputs: `ev_*.csv` (plays), `bestlines_*.csv` (line-shopping board), `middles_*.csv`
-(arbs & middles), `odds_*.csv` (raw).
+Outputs: `ev_*.csv` (plays), `middles_*.csv` (arbs & middles), `screen_*.csv` (the odds
+screen: one row per pick, one column per book), `bestlines_*.csv` (best price per number),
+`odds_*.csv` (raw).
 
 No laptop needed: the **`ev scan`** Action (GitHub → Actions → ev scan → Run workflow;
 pick league/season/week) runs the same command on GitHub's runner with the repo's

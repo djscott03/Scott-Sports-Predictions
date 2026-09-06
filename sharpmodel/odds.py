@@ -415,6 +415,80 @@ def best_lines(odds: pd.DataFrame) -> pd.DataFrame:
     return o.loc[idx, ["home", "away", "market", "side", "line", "price", "book"]].reset_index(drop=True)
 
 
+# ---------------- odds screen ----------------
+US_BOOKS = ["draftkings", "fanduel", "betmgm", "williamhill_us", "espnbet", "fanatics", "betrivers", "hardrockbet",
+            "hardrockbet_fl", "hardrockbet_oh", "betparx", "ballybet", "fliff", "bovada", "betonlineag", "betus",
+            "lowvig", "mybookieag", "superbook", "unibet_us", "twinspires", "wynnbet", "pointsbetus", "circasports",
+            "bookmaker"]                                              # column order on the screen; the rest alphabetical
+MARKET_ORDER = ["spreads", "totals", "ml"]
+
+
+def _cell(market, line, price) -> str:
+    p = f"{int(round(float(price))):+d}"
+    if market == "ml" or pd.isna(line): return p
+    if market == "spreads": return f"{'PK' if line == 0 else format(line, '+g')} {p}"
+    return f"{line:g} {p}"                                             # totals / props: over-under is the row
+
+
+def odds_grid(odds: pd.DataFrame, exclude=None) -> pd.DataFrame:
+    """
+    Odds screen: one row per matchup x market x pick (x player for props), one column per book, cell = 'line price'
+    ('-2.5 -110', '47.5 -105', '+130'). Per (row, book) the entry nearest the row's modal number is kept (best price
+    on ties) so alternate lines do not duplicate rows. Books in US_BOOKS order first, then the rest alphabetically;
+    trailing columns best ('-105 @ pinnacle': best price among books AT the modal number) and books (count).
+    grid.attrs['best'] / grid.attrs['off_line']: boolean frames (same rows, book columns) for highlighting -- the best
+    price at the number, and a book posting a DIFFERENT number (look in Arbs & middles). Empty in -> empty out.
+    """
+    if odds is None or len(odds) == 0 or "book" not in odds: return pd.DataFrame()
+    o = odds.copy()
+    if exclude is not None and len(exclude): o = o[~o.book.isin(set(exclude))]
+    o["line"] = pd.to_numeric(o["line"], errors="coerce") if "line" in o else np.nan
+    o["price"] = pd.to_numeric(o["price"], errors="coerce")
+    o = o[o.price.notna()]
+    if o.empty: return pd.DataFrame()
+    o["commence"] = o["commence"].fillna("").astype(str) if "commence" in o else ""
+    o["matchup"] = o.away.astype(str) + " @ " + o.home.astype(str)
+    o["pick"] = np.where(o.market.isin(["spreads", "ml"]), np.where(o.side == "home", o.home, o.away), o.side)
+    keys = ["commence", "matchup", "market"] + (["player"] if "player" in o else []) + ["pick"]
+    if "player" in o: o["player"] = o["player"].fillna("").astype(str)
+    o["_dec"] = o.price.map(decimal_from_american)
+    # a book's main number is the line it prices nearest -110 (alternates sit away from it); the market's number is the
+    # most common main line, ties -> nearest the mean of the main lines, then the lower one
+    o["_off110"] = (o._dec - decimal_from_american(-110)).abs()
+    main = o.sort_values("_off110").drop_duplicates(keys + ["book"])
+    def _modal(s):
+        s = s.dropna()
+        if s.empty: return np.nan
+        m = s.mode()
+        return m.iloc[int((m - s.mean()).abs().argmin())] if len(m) > 1 else m.iloc[0]
+    modal = main.groupby(keys).line.agg(_modal)
+    o = o.merge(modal.rename("_modal"), left_on=keys, right_index=True)
+    o["_gap"] = (o.line - o._modal).abs().fillna(0.0)
+    o = o.sort_values(["_gap", "_dec"], ascending=[True, False]).drop_duplicates(keys + ["book"])
+    o["_mo"] = o.market.map({m: i for i, m in enumerate(MARKET_ORDER)}).fillna(len(MARKET_ORDER))
+    o["_po"] = np.where(o.side.isin(["home", "over", "yes"]), 0, 1)
+    o = o.sort_values(["commence", "matchup", "_mo", "market"] + (["player"] if "player" in o else []) + ["_po"],
+                      kind="stable")
+    books = [b for b in US_BOOKS if b in set(o.book)] + sorted(set(o.book) - set(US_BOOKS))
+    txt, best, off = [], [], []
+    for key, g in o.groupby(keys, sort=False):
+        d = dict(zip(keys, key)); mk = d["market"]
+        at = g[g._gap == 0]
+        b = at.loc[at._dec.idxmax()] if len(at) else None
+        d.update({bk: "" for bk in books})
+        for r in g.itertuples(): d[r.book] = _cell(mk, r.line, r.price)
+        d["best"] = f"{int(round(float(b.price))):+d} @ {b.book}" if b is not None else ""
+        d["books"] = len(g)
+        txt.append(d)
+        best.append({bk: bool(b is not None and bk == b.book) for bk in books})
+        offb = set(g[g._gap > 0].book)
+        off.append({bk: bk in offb for bk in books})
+    grid = pd.DataFrame(txt, columns=keys + books + ["best", "books"])
+    grid.attrs["best"] = pd.DataFrame(best, columns=books)
+    grid.attrs["off_line"] = pd.DataFrame(off, columns=books)
+    return grid
+
+
 def find_arbs(odds: pd.DataFrame) -> pd.DataFrame:
     """Two-way arbs across books at the SAME number (spread/total) or moneyline. Kept for compatibility:
     middles.find_middles supersedes it (different numbers too, middles priced off the fair pmf, stakes)."""

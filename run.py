@@ -18,7 +18,7 @@ Add --epa to use play-by-play EPA (NFL only, slower first download).
 import sys, json
 import pandas as pd
 from sharpmodel import SharpModel, summarize_backtest, load_nfl, load_cfb
-from sharpmodel.odds import fetch_odds, load_odds_csv, find_ev, best_lines, within_hours
+from sharpmodel.odds import fetch_odds, load_odds_csv, find_ev, best_lines, within_hours, odds_grid
 from sharpmodel.middles import find_middles, game_fairs, prop_fairs
 
 pd.set_option("display.width", 200); pd.set_option("display.max_columns", 40)
@@ -113,6 +113,7 @@ elif mode == "ev":
     ev.to_csv(f"ev_{league}_{season}_w{week}.csv", index=False)
     best_lines(odds).to_csv(f"bestlines_{league}_{season}_w{week}.csv", index=False)
     mids.to_csv(f"middles_{league}_{season}_w{week}.csv", index=False)
+    odds_grid(odds, exclude=excl).to_csv(f"screen_{league}_{season}_w{week}.csv", index=False)   # book-by-book grid
 
 elif mode == "props":
     from sharpmodel.odds import (fetch_events, fetch_props, load_props_csv, estimate_prop_credits,
@@ -166,3 +167,4 @@ elif mode == "props":
     mids = find_middles(odds, prop_fairs(full), league, exclude=excl)
     print_middles(mids, "PROP ARBS & MIDDLES")
     mids.to_csv(f"props_middles_{league}_{season}_w{week}.csv", index=False)
+    odds_grid(odds, exclude=excl).to_csv(f"props_screen_{league}_{season}_w{week}.csv", index=False)

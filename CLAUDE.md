@@ -17,7 +17,8 @@ sharpmodel/pricing.py      cover probs w/ push handling, devig, EV, fractional K
 sharpmodel/adjustments.py  rest, wind/temp, QB-change flags, manual injury hook
 sharpmodel/engine.py       SharpModel.fit_as_of / price_games / predict_week / backtest, BetTracker (CLV)
 sharpmodel/odds.py         The Odds API (ODDS_API_KEY) + CSV ingest, sharp_fair -> blended_fair (model nudge),
-                           find_ev, best_lines, find_arbs (legacy same-number arbs; middles.py supersedes it);
+                           find_ev, best_lines, find_arbs (legacy same-number arbs; middles.py supersedes it),
+                           within_hours, NON_US_BOOKS / US_BOOKS, odds_grid (the odds screen; attrs best/off_line);
                            every HTTP call goes through _get -> OddsAPIError (status + body, never the URL/key);
                            player-prop ingest: fetch_events (free; attrs['remaining']) -> estimate_prop_credits ->
                            fetch_props (per event; skips failed games, attrs['failed'], stops on 401/402/429)
@@ -37,10 +38,11 @@ run.py                     CLI: backtest | predict | ev (--csv --hours --exclude
                            --exclude takes book keys or 'nonus' (odds.NON_US_BOOKS)
 holdout.py                 fit blend weight on early seasons, confirm on held-out ones
 publish_card.py            auto-detect week -> predictions/<league>/<season>_wNN.{md,csv} + graded README index
-app.py                     Streamlit dashboard (tabs: +EV, arbs & middles, best lines, model card, props
-                           [button-gated; prop middles under the board])
+app.py                     Streamlit dashboard (tabs: +EV, arbs & middles, odds screen [odds.odds_grid: row per
+                           pick x column per book, best price green / off-number amber], model card, props
+                           [button-gated; prop middles + prop odds screen under the board])
 lines_template.csv         --csv schema for game lines;  props_template.csv  --csv schema for props (both tracked)
-tests/                     offline pytest (89 tests, ~7s; incl. AppTest smoke + subprocess runs of run.py ev/props);
+tests/                     offline pytest (91 tests, ~7s; incl. AppTest smoke + subprocess runs of run.py ev/props);
                            conftest chdir's to repo root
 .github/workflows/ci.yml           pytest on push/PR (python 3.12)
 .github/workflows/weekly-card.yml  cron Tue+Thu 13:00 UTC + manual dispatch; commits predictions/
@@ -114,7 +116,7 @@ tests/                     offline pytest (89 tests, ~7s; incl. AppTest smoke + 
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
 
 ## Verified state (2026-09-05, local .venv on python 3.9; CI uses 3.12)
-- `python -m pytest -q tests` → 89 passed in ~7s (15 original + props projections/pricing,
+- `python -m pytest -q tests` → 91 passed in ~7s (15 original + props projections/pricing,
   prop ingestion + run.py subprocess runs, dashboard AppTest, publish grading, holdout,
   `tests/test_margins.py`, `tests/test_middles.py` incl. a subprocess run of run.py ev + props;
   the 2026-09-05 second review pass added 9: yes-only longshot bound, bad-body / transport-failure

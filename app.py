@@ -15,11 +15,13 @@ returns; the board is priced from there with the sidebar's blend weight and EV t
 so a rerun or a failed projection can never discard paid-for data.
 """
 import os, time
+import numpy as np
 import pandas as pd
 import streamlit as st
 
 from sharpmodel import SharpModel, load_nfl, load_cfb, props
 from sharpmodel.odds import (fetch_odds, find_ev, best_lines, parse_odds_json, fetch_events, fetch_props, within_hours,
+                             odds_grid,
                              estimate_prop_credits, PROP_MARKETS_DEFAULT, PROP_MARKETS_ALL)
 from sharpmodel.props import load_player_weeks, project_players, fit_dispersion, price_props
 from sharpmodel.middles import find_middles, game_fairs, prop_fairs
@@ -128,6 +130,26 @@ MID_NOTE = ("Two legs at two books, stakes split so a miss (the sides split) cos
             "worse-priced leg first, confirm it is accepted, then the other. Same-book pairs are excluded.")
 
 
+SCREEN_NOTE = ("One row per pick, one column per book, cell = 'number price'. Green = the best price among the books "
+               "on the market's number; amber = that book is on a DIFFERENT number (a middle candidate: see Arbs & "
+               "middles). 'best' is the green cell; excluded books are hidden.")
+
+
+def screen_view(grid):
+    """The odds screen: best price at the number in green, off-number books in amber."""
+    if grid is None or grid.empty:
+        st.success("No lines in the window."); return
+    show = grid.copy()
+    if show.commence.astype(bool).any(): show["commence"] = kickoff(show.commence)
+    best, off = grid.attrs["best"], grid.attrs["off_line"]
+    books = list(best.columns)
+    def paint(col):
+        return np.where(best[col.name].values, "background-color:#1b5e20;color:#fff",
+                        np.where(off[col.name].values, "background-color:#7a5c00;color:#fff", ""))
+    st.dataframe(show.style.apply(paint, axis=0, subset=books), width="stretch", hide_index=True)
+    st.caption(SCREEN_NOTE)
+
+
 def middles_view(m):
     show = m.copy()
     show["commence"] = kickoff(show.commence)
@@ -163,7 +185,7 @@ else:
     c4.metric("Arbs & middles", len(mids), help="cross-book pairs that cannot lose or are +EV to middle")
     c5.metric("Odds age", f"{age:.0f} min", help=f"Refreshes every {REFRESH_MIN} min")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["+EV plays", "Arbs & middles", "Best lines", "Model card", "Props"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["+EV plays", "Arbs & middles", "Odds screen", "Model card", "Props"])
 if has_odds:
     with tab1:
         if len(ev):
@@ -188,7 +210,7 @@ if has_odds:
             st.success("No cross-book arbs or +EV middles on the board right now.")
         st.caption(MID_NOTE)
     with tab3:
-        st.dataframe(best_lines(odds), width="stretch", hide_index=True)
+        screen_view(odds_grid(odds, exclude=excl))
     with tab4:
         if preds is not None:
             cols = ["away", "home", "market_margin", "model_margin", "fair_margin", "spread_side",
@@ -285,6 +307,8 @@ with tab5:
                 st.caption(MID_NOTE + " Prop limits are low.")
             else:
                 st.caption("No cross-book prop arbs or +EV middles in the last scan. " + MID_NOTE)
+            st.subheader("Prop odds screen")
+            screen_view(odds_grid(raw["odds"], exclude=excl))
             st.caption(f"Scanned {pd.Timestamp.fromtimestamp(raw['at']).strftime('%H:%M:%S')} server time; the board stays "
                        "until you scan again. Quota: each scan bills games x markets x regions credits from the free "
                        "500/month Odds API tier (the ≈N on the button), on top of the main board's 1 per refresh. "

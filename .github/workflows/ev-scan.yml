@@ -91,5 +91,6 @@ jobs:
           path: |
             ev_*.csv
             middles_*.csv
+            screen_*.csv
             bestlines_*.csv
             odds_*.csv

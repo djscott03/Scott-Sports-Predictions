@@ -9,7 +9,7 @@ import sharpmodel
 from sharpmodel import props
 from sharpmodel.odds import ODDS_API, EVENTS_API, PROPS_API
 
-TABS = ["+EV plays", "Arbs & middles", "Best lines", "Model card", "Props"]
+TABS = ["+EV plays", "Arbs & middles", "Odds screen", "Model card", "Props"]
 NFL = "americanfootball_nfl"
 APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")   # streamlit >= 1.5x resolves
                                                                                              # relative paths against this file
@@ -139,7 +139,8 @@ def test_scan_button_bills_once_and_the_board_survives_reruns(monkeypatch):
     assert len(raw["odds"]) == 4 and raw["failed"] == [] and list(raw["odds"].columns)[:4] == ["event_id", "commence", "home", "away"]
     board = at.session_state["props"]["ev"]
     assert set(zip(board.book, board.side)) == {("fanduel", "over"), ("draftkings", "under")}   # both beat the 264.5 consensus
-    assert (board.ev_pct >= 0.015).all() and (board["flags"] == "no_proj").all() and len(at.dataframe) == 2
+    assert (board.ev_pct >= 0.015).all() and (board["flags"] == "no_proj").all()
+    assert len(at.dataframe) == 3                                   # board, prop middles, prop odds screen
     mid = at.session_state["props"]["mid"]                            # the same two books make a 20-yard middle
     assert len(mid) == 1 and mid.iloc[0].window == "255-274" and mid.iloc[0].type == "middle" and mid.iloc[0].ev_pct > 0
     assert mid.iloc[0].bet_a == "J. Hurts O 254.5 -110 @ fanduel" and mid.iloc[0].bet_b == "J. Hurts U 274.5 -110 @ draftkings"
@@ -149,7 +150,7 @@ def test_scan_button_bills_once_and_the_board_survives_reruns(monkeypatch):
     at.run()                                                          # rerun (auto-refresh, slider move, ...)
     assert not at.exception, at.exception
     assert len(calls) == n and calls.count(billed) == 1               # nothing re-fetched; events/odds are cached
-    assert len(at.session_state["props_odds"]["odds"]) == 4 and len(at.dataframe) == 2
+    assert len(at.session_state["props_odds"]["odds"]) == 4 and len(at.dataframe) == 3
 
 
 def test_scan_remaining_beats_the_cached_events_count(monkeypatch):
