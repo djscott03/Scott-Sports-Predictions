@@ -43,6 +43,9 @@ CFBD_KEY = secret("CFBD_API_KEY")
 REFRESH_MIN = int(secret("REFRESH_MIN", 20))
 DEMO_ODDS = secret("SHARPMODEL_DEMO_ODDS")
 PIN = secret("SCAN_PIN")                              # set before sharing the link: gates props scans + force refresh
+BOARD_SOURCE = secret("BOARD_SOURCE", "snapshot")     # 'snapshot': read the Action's published board (0 credits per
+                                                      # viewer, refreshed on its cron); 'live': every REFRESH_MIN pull
+BOARD_URL = secret("BOARD_URL", "https://raw.githubusercontent.com/djscott03/Scott-Sports-Predictions/board/board")
 MAX_CREDITS = int(secret("MAX_CREDITS_PER_DAY", 60))  # board credits per day (3 per pull at 'core'); then the odds freeze
 ODDS_BOOKS = secret("ODDS_BOOKS", "core")             # 'core' (10 books incl. Pinnacle, 3 credits/pull), 'wide' (20, 6), or a list
 PULL_COST = odds_credits(books=ODDS_BOOKS)            # the estimate; the API's x-requests-last replaces it after the first pull
@@ -147,7 +150,12 @@ with st.sidebar.expander("Model & refresh", expanded=False):
     pin = st.text_input("Owner PIN", type="password", help="Set SCAN_PIN in the app secrets before sharing the link: "
                         "only the PIN can scan props or force a refresh (both spend credits).") if PIN else ""
     owner = (not PIN) or pin == PIN
-    if owner and st.button("Force refresh now"):
+    if owner and st.button("Force refresh now", help="Re-read the board (free in snapshot mode; a pull in live mode)"):
+        st.cache_data.clear()
+    if owner and BOARD_SOURCE == "snapshot" and not DEMO_ODDS and ODDS_KEY and \
+            st.button(f"Pull fresh odds now ({PULL_COST} credits)",
+                      help="One live pull from the API, counted against MAX_CREDITS_PER_DAY. Viewers keep reading the snapshot."):
+        st.session_state["live_pull"] = True
         st.cache_data.clear()
 excl = [b.strip() for b in books_excl.split(",") if b.strip()]
 if "nonus" in excl:
@@ -173,15 +181,19 @@ def pull_budget():
     is that a link passed around cannot spend more than MAX_CREDITS a day on the game-line board."""
     return {"day": None, "spent": 0, "cost": PULL_COST, "last": None}
 
-@st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Pulling odds from every book…")
-def load_odds(league, season):
-    """-> (odds, fetched_at, credits_remaining, paused). Demo file, or the live board (PULL_COST credits: 3 markets x
-    ceil(books/10)), or empty without a key. Past the daily budget the last board is served unchanged (paused=True)
-    until the New York date changes."""
-    if DEMO_ODDS:
-        return load_odds_csv(DEMO_ODDS), time.time(), None, False
-    if not ODDS_KEY:
-        return pd.DataFrame(), time.time(), None, False
+@st.cache_data(ttl=60 * 5, show_spinner="Reading the published board…")
+def load_snapshot(league):
+    """The board the alerts Action published to the `board` branch: (odds, meta). Free to read, no key needed.
+    Raises when nothing has been published yet."""
+    import io, requests
+    r = requests.get(f"{BOARD_URL}/odds_{league}.csv", timeout=20); r.raise_for_status()
+    m = requests.get(f"{BOARD_URL}/meta_{league}.json", timeout=20); m.raise_for_status()
+    odds = pd.read_csv(io.StringIO(r.text))
+    return odds, m.json()
+
+def live_pull(league, season):
+    """One budgeted live pull -> (odds, fetched_at, remaining, paused) or None when there is no key."""
+    if not ODDS_KEY: return None
     b, today = pull_budget(), pd.Timestamp.now(tz="America/New_York").date()
     if b["day"] != today:
         b["day"], b["spent"] = today, 0
@@ -199,12 +211,35 @@ def load_odds(league, season):
     b["last"] = (df, time.time(), df.attrs.get("remaining"))
     return df, time.time(), df.attrs.get("remaining"), False
 
+@st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Loading the board…")
+def load_odds(league, season, live=False):
+    """-> (odds, fetched_at, credits_remaining, paused, source). source: 'demo' | 'snapshot' | 'live' | 'none'.
+    Snapshot mode (the default) serves the Action's published board -- viewers never spend a credit -- and only
+    pulls live when the owner asks (live=True) or nothing has been published yet; a live pull newer than the
+    snapshot (this process's own, budgeted) wins. Live mode pulls every REFRESH_MIN within MAX_CREDITS_PER_DAY."""
+    if DEMO_ODDS:
+        return load_odds_csv(DEMO_ODDS), time.time(), None, False, "demo"
+    if BOARD_SOURCE == "snapshot" and not live:
+        snap = None
+        try:
+            odds, meta = load_snapshot(league)
+            snap = (odds, float(meta.get("fetched_at") or 0), meta.get("remaining"), False, "snapshot")
+        except Exception:
+            snap = None                                                # nothing published yet (or GitHub hiccup)
+        last = pull_budget()["last"]
+        if last is not None and (snap is None or last[1] > snap[1]):   # this process pulled something fresher
+            return last[0], last[1], last[2], False, "live"
+        if snap is not None: return snap
+    got = live_pull(league, season)
+    if got is None: return pd.DataFrame(), time.time(), None, False, "none"
+    return got + ("live",)
+
 @st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Pricing the board…")
 def price_board(league, season, week, model_w, min_ev, markets, excl, hours, teams, max_age, fetched_at, model_fair):
     """+EV rows and arbs/middles for the sidebar settings. Keyed on fetched_at so a fresh odds pull re-prices;
     otherwise a slider change is a cache hit, not a 30 s recompute. Excluded books still anchor the fairs; prices
     older than max_age minutes are hidden from the plays (0 = keep all)."""
-    odds, _, _, _ = load_odds(league, season)
+    odds = load_odds(league, season, st.session_state.get("live_pull", False))[0]
     odds = add_age(within_hours(odds[odds.market.isin(list(markets))], hours), now=fetched_at_ts(fetched_at))
     if teams: odds = odds[odds.home.isin(teams) | odds.away.isin(teams)]
     ev = find_ev(odds, league, model_fair=model_fair, model_weight=model_w, min_ev=min_ev)
@@ -429,7 +464,7 @@ def ev_bet(r):
     if r.market == "totals": return f"{r.team.capitalize()} {r.line:g} <span class='mono'>{am(r.price)}</span>"
     return f"{r.get('player', '')} {r.side} {r.line:g} <span class='mono'>{am(r.price)}</span>"
 
-def top_cards(ev, mids, min_ev, age, remaining, n_games, n_books):
+def top_cards(ev, mids, min_ev, age, remaining, n_games, n_books, source="live"):
     c1, c2, c3 = st.columns(3)
     with c1:
         if len(ev):
@@ -456,22 +491,27 @@ def top_cards(ev, mids, min_ev, age, remaining, n_games, n_books):
                  "Middles appear when books disagree on the number — most often in the hours after a sharp move.")
     with c3:
         cost = pull_budget()["cost"] if not DEMO_ODDS else PULL_COST
+        how = ("Pulled on a schedule by the alerts Action (Sun hourly 9–5 + 8pm, Mon & Thu 7pm, noon Tue–Sat, "
+               f"{cost} credits each); viewing costs nothing, however many people look."
+               if source == "snapshot" else
+               f"Refreshes every {REFRESH_MIN} min while this tab is open ({cost} credits each, {MAX_CREDITS}/day cap).")
         card("info", "Board", f"{n_games} games · {n_books} books",
              f"Odds pulled {age_text(age)}" + (f" · {remaining} credits left this month" if remaining is not None else ""),
-             f"Refreshes every {REFRESH_MIN} min while this tab is open ({cost} credits each, {MAX_CREDITS}/day cap). "
-             "Excluded books are hidden as bets but still set the fair numbers.")
+             how + " Excluded books are hidden as bets but still set the fair numbers.")
 
 # -------- main --------
-odds, fetched_at, remaining, paused = load_odds(league, season)
-has_odds = not odds.empty                                          # a key and a live pull; the window may still empty the board
+odds, fetched_at, remaining, paused, source = load_odds(league, season, st.session_state.pop("live_pull", False))
+has_odds = not odds.empty                                          # a board; the window may still empty it
 age = (time.time() - fetched_at) / 60
 pills = []
 if DEMO_ODDS: pills.append('<span class="sm-pill demo">demo file</span>')
 if paused:
     pills.append(f'<span class="sm-pill warn">paused · {MAX_CREDITS} credits today, odds frozen until midnight</span>')
+elif source == "snapshot":
+    pills.append(f'<span class="sm-pill live">● snapshot · pulled {age_text(age)} · free to view</span>')
 else:
     pills.append(f'<span class="sm-pill live">● live · odds {age_text(age)}</span>' if has_odds else
-                 '<span class="sm-pill warn">no odds key</span>')
+                 '<span class="sm-pill warn">no board yet</span>')
 if remaining is not None: pills.append(f'<span class="sm-pill">{remaining} credits left</span>')
 pills.append(f'<span class="sm-pill">{"market only" if model_w == 0 else f"model {model_w:.0%}"}</span>')
 st.markdown(f'<div class="sm-hero"><div><div class="sm-eyebrow">{league.upper()} · {season} · week {week}</div>'
@@ -479,7 +519,9 @@ st.markdown(f'<div class="sm-hero"><div><div class="sm-eyebrow">{league.upper()}
             unsafe_allow_html=True)
 if odds.empty:
     st.warning(f"Daily credit budget reached ({MAX_CREDITS} credits); the board will pull again after midnight New York time."
-               if paused else NO_KEY)
+               if paused else
+               (NO_KEY + " Or wait for the alerts Action to publish the first board snapshot (it runs on a schedule)."
+                if BOARD_SOURCE == "snapshot" else NO_KEY))
 else:
     try:
         preds, ratings, mkt_ratings = model_card(league, season, week)
@@ -510,7 +552,7 @@ else:
     c4.metric("Arbs & middles", len(mids), help="cross-book pairs that cannot lose or are +EV to middle")
     c5.metric("Odds age", "now" if age < 1 else f"{age:.0f} min", help=f"Refreshes every {REFRESH_MIN} min")
     st.markdown('<div class="sm-section">Right now</div>', unsafe_allow_html=True)
-    top_cards(ev, mids, min_ev, age, remaining, odds.event_id.nunique(), odds.book.nunique())
+    top_cards(ev, mids, min_ev, age, remaining, odds.event_id.nunique(), odds.book.nunique(), source)
     st.markdown('<div class="sm-section">The board</div>', unsafe_allow_html=True)
 
 labels = ["Top picks", "+EV plays", "Arbs & middles", "Odds screen", "Model card", "Props"]
@@ -681,6 +723,10 @@ st.markdown(f'<div class="sm-foot">Last odds pull {pd.Timestamp.fromtimestamp(fe
 # -------- auto refresh --------
 if auto:
     from streamlit_autorefresh import st_autorefresh
-    secs_left = max(REFRESH_MIN * 60 - (time.time() - fetched_at), 15)
+    if source == "snapshot":                                      # free: just look for a newer published board
+        secs_left = REFRESH_MIN * 60
+        st.sidebar.caption(f"Checks for a newer snapshot every {REFRESH_MIN} min (free)")
+    else:
+        secs_left = max(REFRESH_MIN * 60 - (time.time() - fetched_at), 15)
+        st.sidebar.caption(f"Next refresh in ~{secs_left/60:.0f} min")
     st_autorefresh(interval=int(secs_left * 1000), key="odds_refresh")
-    st.sidebar.caption(f"Next refresh in ~{secs_left/60:.0f} min")

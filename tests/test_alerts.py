@@ -384,12 +384,12 @@ def _expand(field, lo, hi):
     return out
 
 
-def test_alerts_workflow_parses_and_schedule_is_12_runs_a_week():
+def test_alerts_workflow_parses_and_schedule_is_17_runs_a_week():
     with open(os.path.join(ROOT, ".github", "workflows", "alerts.yml"), encoding="utf-8") as f:
         raw = f.read()
     wf = yaml.safe_load(raw)
     on = wf.get("on") or wf.get(True)                                               # PyYAML reads the key `on` as True
-    assert wf["name"] == "alerts" and wf["permissions"] == {"contents": "read"}
+    assert wf["name"] == "alerts" and wf["permissions"] == {"contents": "write"}   # the board branch push
     assert wf["concurrency"] == {"group": "alerts", "cancel-in-progress": False}    # overlapping runs queue, never double-send
     inputs = on["workflow_dispatch"]["inputs"]
     assert inputs["league"]["default"] == "nfl" and inputs["test"]["default"] == "false"
@@ -406,8 +406,8 @@ def test_alerts_workflow_parses_and_schedule_is_12_runs_a_week():
         hours, days = _expand(hour, 0, 23), _expand(dow, 0, 6)
         assert max(hours) <= 23 and max(days) <= 6
         runs += len(hours) * len(days)
-    assert runs == 12                                                               # 9+1 Sun/SNF + 1 TNF + 1 MNF pregame
-    assert runs * credits_per_run("core") * 52 / 12 < 220                             # ~210 credits/month of the free 500
+    assert runs == 17                                                               # 9+1 Sun/SNF + TNF + MNF pregame + 5 noon runs
+    assert runs * credits_per_run("core") * 52 / 12 < 240                             # ~220 credits/month of the free 500
     assert "0 0 * * 1" in crons and "0 13-21 * * 0" in crons                         # SNF wraps into Monday UTC
     steps = wf["jobs"]["alerts"]["steps"]
     uses = [s.get("uses", "") for s in steps]
@@ -417,9 +417,26 @@ def test_alerts_workflow_parses_and_schedule_is_12_runs_a_week():
     scan_step = next(s for s in steps if "alerts.py" in s.get("run", ""))
     assert set(scan_step["env"]) >= {"ODDS_API_KEY", "DISCORD_WEBHOOK", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "BOOKS"}
     assert "--test" in scan_step["run"] and "inputs.test" in raw and '--books "$BOOKS"' in scan_step["run"]
-    # a scheduled run with no channel to deliver to stops before the pull (0 credits); manual runs always pull
-    guard = scan_step["run"].split("python alerts.py")[0]
-    assert '"$GITHUB_EVENT_NAME" = "schedule"' in guard and "DISCORD_WEBHOOK" in guard and "exit 0" in guard
-    assert "GITHUB_STEP_SUMMARY" in raw and "git push" not in raw and "git commit" not in raw
-    assert "3 credits" in raw and "12 runs/week" in raw and "markets x regions" in raw.lower()   # the credit math stays documented
+    assert "--snapshot board" in scan_step["run"] and "GITHUB_EVENT_NAME" not in scan_step["run"]   # every run publishes
+    # the snapshot goes to the `board` branch only: an orphan commit force-pushed there, never to main
+    pub = next(s for s in steps if s.get("name", "").startswith("publish the board snapshot"))
+    assert "git push -qf origin HEAD:board" in pub["run"] and "--orphan" in pub["run"] and "always()" in pub["if"]
+    assert "origin main" not in raw and "HEAD:main" not in raw
+    assert "GITHUB_STEP_SUMMARY" in raw
+    assert "3 credits" in raw and "17 runs/week" in raw and "markets x regions" in raw.lower()   # the credit math stays documented
     assert "1 credit" not in raw.replace("1 credit per market", "")                   # the old "one credit per run" claim is gone
+
+
+def test_snapshot_writes_the_board_and_meta(tmp_path, monkeypatch, capsys):
+    """--snapshot DIR: the raw board (every row, incl. `updated`) + meta with the pull time and credits picture."""
+    monkeypatch.chdir(tmp_path)
+    board = _board([125, 110]).assign(updated="2026-09-13T15:00:00Z")
+    _feed(monkeypatch, board)
+    assert alerts.main(["nfl", "--csv", "x.csv", "--dry-run", "--state", "s.json", "--snapshot", "board"]) == 0
+    out = capsys.readouterr().out
+    assert "[alerts] snapshot -> board/odds_nfl.csv" in out
+    got = pd.read_csv(tmp_path / "board" / "odds_nfl.csv")
+    assert len(got) == len(board) and set(got.columns) >= {"event_id", "book", "market", "side", "line", "price", "updated"}
+    meta = json.loads((tmp_path / "board" / "meta_nfl.json").read_text())
+    assert meta["league"] == "nfl" and meta["n_events"] == 2 and meta["n_books"] == 2 and meta["rows"] == len(board)
+    assert abs(meta["fetched_at"] - pd.Timestamp.now(tz="UTC").timestamp()) < 120 and meta["cost"] is None

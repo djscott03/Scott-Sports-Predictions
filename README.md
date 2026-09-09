@@ -92,9 +92,14 @@ with the top picks.
 Filters (sidebar): min EV, kickoff window, markets, **Teams**, **Books** (your accounts —
 everything else is hidden as a bet but still sets the fair numbers), plus the raw exclude box.
 
-Sharing the link: the board is one pull (3 credits) per 20 min for *everyone*, capped by
-`MAX_CREDITS_PER_DAY` (default 60; then it freezes until midnight); set `SCAN_PIN` so only
-you can scan props or force a refresh — see DEPLOY.md.
+**Sharing the link costs nothing per viewer.** The dashboard's default (`BOARD_SOURCE =
+snapshot`) reads the board the `alerts` Action publishes to the repo's `board` branch on its
+fixed schedule — Sunday hourly 9am–5pm ET plus 8pm, Monday and Thursday 7pm, and noon
+Tuesday–Saturday, 17 pulls × 3 credits ≈ 220 a month — so the monthly spend is the cron, full
+stop, however many buddies are looking. The owner PIN adds a *Pull fresh odds now (3 credits)*
+button for the moments you want a live number; `BOARD_SOURCE = live` restores per-viewer
+pulls (every 20 min, capped by `MAX_CREDITS_PER_DAY`). Set `SCAN_PIN` so only you can scan
+props or pull — see DEPLOY.md.
 
 Look: Browns orange on dark brown with Cavs wine/gold accents (`.streamlit/config.toml` +
 the CSS block at the top of `app.py`); signal colours stay universal (green best price, red
@@ -280,12 +285,13 @@ set the Action only prints it into the run's job summary.
 The free Odds API tier is 500 credits a month and every scan is **3 credits** (3 markets × 10
 named books; naming books instead of regions is what keeps Pinnacle on the board for the price
 of one region), so the schedule in `.github/workflows/alerts.yml` is deliberately thin:
-**Sunday hourly 9am–5pm ET plus 8pm for SNF (10), and 7pm ET on Thursday and Monday for the
-TNF / MNF pregame (2)** — 12 runs, 36 credits a week, about 155 a month, leaving ~345 for
-the dashboard and manual scans (the file's header lists the lines to add back — noon-ET
-openers, kickoff-time runs — when the budget allows). A scheduled run with no
-webhook secret exits *before* pulling (0 credits), so the schedule can sit on `main` until
-you add the secret. GitHub cron is UTC, so the file's comments carry the conversion; after the November
+**Sunday hourly 9am–5pm ET plus 8pm for SNF (10), 7pm ET Thursday and Monday for the TNF /
+MNF pregame (2), and noon ET Tuesday–Saturday (5)** — 17 runs, 51 credits a week, about 220
+a month, leaving ~280 for props scans and the occasional owner pull. Every run also publishes
+the board snapshot the dashboard serves, so this schedule *is* the site's refresh rate: more
+often on game days, daily otherwise, and free to view. Runs happen with or without a webhook
+(the board still gets published); alerts go out once the secret exists. GitHub cron is UTC, so
+the file's comments carry the conversion; after the November
 clock change every run lands an hour earlier on your wall clock, which still covers the 1pm /
 4pm / SNF windows.
 
@@ -409,7 +415,8 @@ tests/            offline pytest suite (pricing math, ratings, walk-forward, adj
   backtest.yml    manual walk-forward backtest -> job summary
   props-scan.yml  manual-only prop scan -> job summary + CSV artifact (never scheduled: quota)
   ev-scan.yml     manual-only +EV / arbs & middles scan (3 credits) -> job summary + CSV artifact
-  alerts.yml      game-day cron (12 runs/week x 3 credits) + manual: alerts.py -> Discord / Telegram
+  alerts.yml      game-day cron (17 runs/week x 3 credits) + manual: alerts.py -> board snapshot
+                  (branch `board`, read by the dashboard for free) + Discord / Telegram alerts
 ```
 
 ### The number pipeline for one game

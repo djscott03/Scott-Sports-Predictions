@@ -369,7 +369,25 @@ def parse_args(argv=None):
     p.add_argument("--top", type=int, default=5, help="at most this many NEW picks per run, applied after the dedupe (5)")
     p.add_argument("--test", action="store_true", help="send the current top pick regardless of state; no state write")
     p.add_argument("--dry-run", action="store_true", help="no HTTP: print + summary only (state is still saved)")
+    p.add_argument("--snapshot", metavar="DIR",
+                   help="also write the raw board to DIR/odds_<league>.csv + meta_<league>.json (the dashboard's "
+                        "static snapshot: the Action publishes it so viewers never spend a credit)")
     return p.parse_args(argv)
+
+
+def write_snapshot(odds: pd.DataFrame, league: str, folder: str, now, cost=None, books: str = "") -> str:
+    """The board as the dashboard reads it: every row (incl. `updated`), plus meta with the pull time (epoch) and
+    the credits picture. Written before the scan so a scan crash never loses a paid-for pull."""
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"odds_{league}.csv")
+    odds.to_csv(path, index=False)
+    n_events, n_books = (odds.event_id.nunique(), odds.book.nunique()) if len(odds) else (0, 0)
+    meta = dict(league=league, fetched_at=float(_utc(now).timestamp()), fetched_iso=_utc(now).isoformat(),
+                remaining=odds.attrs.get("remaining"), cost=cost, n_events=int(n_events), n_books=int(n_books),
+                books=books, rows=int(len(odds)))
+    with open(os.path.join(folder, f"meta_{league}.json"), "w") as f:
+        json.dump(meta, f, indent=1)
+    return path
 
 
 def main(argv=None) -> int:
@@ -386,6 +404,8 @@ def main(argv=None) -> int:
         write_summary(summary_md(a.league, now, "no scan", error=msg))
         return 1
     remaining = odds.attrs.get("remaining")                            # credits left, from the API headers (None: CSV)
+    if a.snapshot:
+        print(f"[alerts] snapshot -> {write_snapshot(odds, a.league, a.snapshot, now, cost, a.books)}")
     n_all, n_books = (odds.event_id.nunique(), odds.book.nunique()) if len(odds) else (0, 0)
     odds = within_hours(odds, a.hours)
     picks, mids = scan(odds, a.league, a.min_ev, a.min_middle_ev, a.max_age, excl)

@@ -38,17 +38,20 @@
   never fetches on its own and keeps the last scan until you click again.
 
 ### Sharing the link with friends (credits)
-- The game-line board is **shared**: one pull per `REFRESH_MIN` minutes for everyone
-  combined, not per viewer. Ten people watching costs the same as one. What costs
-  more is *coverage*: a pull is 3 credits (3 markets × 10 named books), so a tab left
-  open all day keeps pulling — 9 credits/hour at the 20-minute default.
-- `MAX_CREDITS_PER_DAY` (default 60 = 20 pulls ≈ 6½ hours of continuous viewing) caps
-  that: past the budget the last board is served unchanged with a "paused" pill until
-  midnight New York time. The cap is a backstop, not a plan — close the tab when you're
-  not looking. Set 30 if you share widely, or raise `REFRESH_MIN` to 30.
+- **Viewers cost nothing.** By default (`BOARD_SOURCE = snapshot`) the site shows the
+  board the `alerts` Action published to the `board` branch of the repo — a plain file on
+  GitHub, no key involved. The Action pulls on a fixed schedule (Sunday hourly 9am–5pm ET
+  plus 8pm, Monday and Thursday 7pm, noon Tuesday–Saturday: 17 pulls × 3 credits ≈ 220 a
+  month) and that schedule is the entire spend; a hundred people can leave the tab open.
+  The header pill reads "snapshot · pulled 12 min ago · free to view".
+- **You can still go live.** With the owner PIN, *Pull fresh odds now (3 credits)* makes
+  one real pull (counted against `MAX_CREDITS_PER_DAY`, default 60) and the site shows it
+  until the next scheduled snapshot is newer. `BOARD_SOURCE = live` switches the whole
+  site back to per-viewer pulls every `REFRESH_MIN` minutes (the old behaviour; the cap
+  then matters).
 - **Set `SCAN_PIN` before sharing.** Props scans bill games × markets credits to whoever
-  clicks, and Force refresh is 3 credits too. With the PIN set, both need it (sidebar →
-  Model & refresh → Owner PIN); viewers can still see the last props scan.
+  clicks, and the live pull is 3 credits. With the PIN set, both need it (sidebar → Model
+  & refresh → Owner PIN); viewers can still see the last props scan.
   ```toml
   SCAN_PIN = "pick-something"
   MAX_CREDITS_PER_DAY = "60"
@@ -80,10 +83,10 @@ Setup (the secrets are yours to add; click-by-click in README → *Alerts*):
    gets the current top pick. Done; the schedule takes over from there.
 
 Quota: every run is 3 credits (3 markets × 10 named books, Pinnacle included). The schedule
-is Sunday hourly 9am–5pm ET plus 8pm (SNF), and 7pm ET Thursday and Monday for TNF / MNF
-= 12 runs, 36 credits/week (~155/month), which fits under the free 500
-next to the dashboard's `MAX_CREDITS_PER_DAY`. A scheduled run with no webhook secret exits
-before pulling (0 credits). To pause,
+is Sunday hourly 9am–5pm ET plus 8pm (SNF), 7pm ET Thursday and Monday for TNF / MNF, and
+noon ET Tuesday–Saturday = 17 runs, 51 credits/week (~220/month), which fits under the free
+500 with room for props scans. Every run also publishes the dashboard's board snapshot, so
+runs happen with or without a webhook; alerts go out once the secret exists. To pause,
 comment out the `schedule:` block in `alerts.yml`; to tune, edit the input defaults there
 (`min_ev`, `hours`) or the `python alerts.py` flags (`--min-middle-ev`, `--max-age`,
 `--top`, `--exclude`).

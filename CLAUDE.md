@@ -73,13 +73,15 @@ tests/                     offline pytest (110 tests, ~15s; incl. AppTest smoke 
 .github/workflows/props-scan.yml   manual dispatch ONLY (quota); run.py nfl props -> job summary + csv artifact
 .github/workflows/ev-scan.yml      manual dispatch ONLY (3 credits); run.py <league> ev -> +EV + arbs & middles
                                    in the job summary + csv artifact; never commits
-.github/workflows/alerts.yml       alerts.py on a CONSERVATIVE UTC cron (Sun hourly 13-21 + Mon 00 for SNF, Thu 23
-                                   and Mon 23 for TNF/MNF pregame = 12 runs x 3 credits = 36/week, ~155/month; a
-                                   window past midnight is a separate cron line because day-of-week flips at 00:00
-                                   UTC) + manual dispatch (league, test, min_ev, hours, books); a scheduled run with
-                                   no delivery secret exits before the pull (0 credits); alerts_state.json rides
+.github/workflows/alerts.yml       board + alerts on a CONSERVATIVE UTC cron (Sun hourly 13-21 + Mon 00 for SNF,
+                                   Thu 23 / Mon 23 for TNF/MNF pregame, Tue-Sat 16 = 17 runs x 3 credits = 51/week,
+                                   ~220/month; a window past midnight is a separate cron line because day-of-week
+                                   flips at 00:00 UTC) + manual dispatch (league, test, min_ev, hours, books). Every
+                                   run: alerts.py --snapshot board -> orphan commit force-pushed to the `board`
+                                   branch (the dashboard's free snapshot; permissions contents: write; never main)
+                                   -> alerts to whichever channels have secrets; alerts_state.json rides
                                    actions/cache (restore-keys prefix alerts-state-, save if: always()); summary
-                                   appended to the job summary; concurrency group; never commits
+                                   appended to the job summary; concurrency group
 ```
 
 ## Key design decisions (don't undo these)
@@ -149,12 +151,18 @@ tests/                     offline pytest (110 tests, ~15s; incl. AppTest smoke 
   through), not every book x book: the full 272-game board prices in ~2 s instead of ~33 s. The first
   Streamlit Cloud deploy (2026-09-06) sat on "running" for that half-minute — that is what this fixes.
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
+- **The site is a snapshot; the cron is the spend.** `BOARD_SOURCE=snapshot` (default): app.py reads
+  `BOARD_URL` (raw.githubusercontent.com/<repo>/board/board/odds_<league>.csv + meta_<league>.json),
+  which `alerts.py --snapshot board` writes and alerts.yml force-pushes as one orphan commit to the
+  `board` branch (never main: Streamlit Cloud would redeploy). Viewers never pull; the owner PIN's
+  "Pull fresh odds now" makes one budgeted live pull that wins while it is newer than the snapshot;
+  `BOARD_SOURCE=live` is the old per-viewer mode. 17 cron runs/week x 3 credits ≈ 220/month.
 - **Alerts are one 3-credit pull per run and dedupe by content, not by time.** `alerts.py` keys a pick on
   matchup|market|team|line|book|price and a middle on its two `bet_a|bet_b` strings (raw book keys), so
   a re-price is a new alert and the same number is never sent twice within 24 h; the state is saved
   only after delivery succeeded (a dead webhook = exit 1, nothing remembered, re-sent next run) and
   `--test` never writes it. The state file lives in the Action's cache (`alerts-state-<run_id>`,
-  restored by prefix), never in git. The cron is 12 runs x 3 = 36 credits/week on purpose: the owner will not pay
+  restored by prefix), never in git. The cron is 17 runs x 3 = 51 credits/week on purpose: the owner will not pay
   for the API, so every scheduled line in alerts.yml has to justify itself in the header comment; do
   not add a `*/5` schedule. Book names come from `alerts.BOOK_NAMES`, a copy of app.py's table --
   importing app.py would pull streamlit onto the runner.
@@ -234,8 +242,8 @@ tests/                     offline pytest (110 tests, ~15s; incl. AppTest smoke 
 ## Backlog (owner's roadmap, rough priority)
 1. ~~Add secrets; deploy app.py to Streamlit Cloud~~ — DONE 2026-09-05/06: secrets set by the owner,
    app live at scott-sports-predictions-dg3viypucz4nyba8clzscc.streamlit.app (auto-redeploys on push to main)
-2. ~~Telegram/Discord alert on new +EV line~~ — DONE 2026-09-06/09: `alerts.py` + `alerts.yml` (12 runs/week
-   on game days x 3 credits ≈ 155/month, dedupe state in the Action cache); the owner still has to add the
+2. ~~Telegram/Discord alert on new +EV line~~ — DONE 2026-09-06/09: `alerts.py` + `alerts.yml` (17 runs/week
+   x 3 credits ≈ 220/month, publishes the board snapshot too, dedupe state in the Action cache); the owner still has to add the
    `DISCORD_WEBHOOK` secret and fire the test run (README → Alerts, DEPLOY.md → Option B)
 3. ~~Run the same backtest on CFB~~ — DONE 2026-09-05 (50.4% ATS, see verified state); next
    is a CFB `ev`/middles scan, not ratings work

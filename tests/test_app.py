@@ -16,7 +16,8 @@ APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 
 
 class _Resp:
-    def __init__(self, payload, headers=None): self._payload, self.headers = payload, headers or {}
+    def __init__(self, payload, headers=None, text=""):
+        self._payload, self.headers, self.text, self.status_code = payload, headers or {}, text, 200
     def json(self): return self._payload
     def raise_for_status(self): pass
 
@@ -36,12 +37,13 @@ def _prop_event(events):
         {"key": "fanduel", "markets": [{"key": "player_pass_yds", "last_update": "t", "outcomes": [o("Over", 254.5), o("Under", 254.5)]}]}])
 
 
-def _run(monkeypatch, key):
+def _run(monkeypatch, key, source="live"):
     st.cache_data.clear()                                   # st.cache_data is process-wide across AppTest runs
     st.cache_resource.clear()                               # so is the daily pull budget
     if key: monkeypatch.setenv("ODDS_API_KEY", key)
     else: monkeypatch.delenv("ODDS_API_KEY", raising=False)
     for v in ("SCAN_PIN", "MAX_CREDITS_PER_DAY", "ODDS_BOOKS"): monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("BOARD_SOURCE", source)              # most tests exercise the live pull; see the snapshot test
     at = AppTest.from_file(APP, default_timeout=120)
     at.run()
     assert not at.exception, at.exception
@@ -254,3 +256,32 @@ def test_daily_credit_budget_freezes_the_board(monkeypatch):
     assert calls.count(ODDS_API.format(sport=NFL)) == 1              # budget spent: no second pull
     assert at.metric[0].value == "1"                                 # ...but the last board is still served
     assert any("paused" in m.value for m in at.markdown)
+
+
+def test_snapshot_mode_serves_the_published_board_for_free(monkeypatch):
+    """Default mode: the board comes from the Action's published snapshot on the `board` branch. Viewers never
+    hit the Odds API; the pill says so; an owner can still force one live pull."""
+    import json as _json
+    from sharpmodel.odds import parse_odds_json
+    events, calls = _upcoming(), []
+    snap = parse_odds_json(_game_event(events), "nfl")
+    csv_text, meta = snap.to_csv(index=False), dict(league="nfl", fetched_at=pd.Timestamp.now(tz="UTC").timestamp() - 600,
+                                                     remaining=271, cost=3, n_events=1, n_books=2)
+    def fake_get(url, params=None, timeout=None):
+        calls.append(url)
+        if url.endswith("/odds_nfl.csv"): return _Resp(None, text=csv_text)
+        if url.endswith("/meta_nfl.json"): return _Resp(meta)
+        if url == EVENTS_API.format(sport=NFL): return _Resp(events, {"x-requests-remaining": "271"})
+        if url == ODDS_API.format(sport=NFL): raise AssertionError("snapshot mode must not pull live on load")
+        raise AssertionError(f"unexpected call: {url}")
+    monkeypatch.setattr(requests, "get", fake_get)
+    def no_nflverse(*a, **k): raise RuntimeError("offline test")
+    monkeypatch.setattr(sharpmodel, "load_nfl", no_nflverse)
+    at = _run(monkeypatch, "k", source="snapshot")
+    assert at.metric[0].value == "1" and ODDS_API.format(sport=NFL) not in calls
+    assert any("snapshot · pulled 10 min ago" in m.value and "free to view" in m.value for m in at.markdown)
+    assert any("271 credits left" in m.value for m in at.markdown)
+    assert any(b.label.startswith("Pull fresh odds now (3 credits)") for b in at.button)
+    # no key at all: the snapshot still serves the board (that is the point of sharing it)
+    at = _run(monkeypatch, None, source="snapshot")
+    assert at.metric[0].value == "1" and len(at.warning) == 1          # only the Props tab warns about the key
