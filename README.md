@@ -280,9 +280,10 @@ set the Action only prints it into the run's job summary.
 The free Odds API tier is 500 credits a month and every scan is **3 credits** (3 markets × 10
 named books; naming books instead of regions is what keeps Pinnacle on the board for the price
 of one region), so the schedule in `.github/workflows/alerts.yml` is deliberately thin:
-**Sunday hourly 9am–5pm ET plus 8pm for SNF (10), Thursday and Monday at 7pm and 8pm ET (2
-each), and noon ET Tuesday and Friday for the openers (2)** — 16 runs, 48 credits a week,
-about 210 a month, leaving ~290 for the dashboard and manual scans. A scheduled run with no
+**Sunday hourly 9am–5pm ET plus 8pm for SNF (10), and 7pm ET on Thursday and Monday for the
+TNF / MNF pregame (2)** — 12 runs, 36 credits a week, about 155 a month, leaving ~345 for
+the dashboard and manual scans (the file's header lists the lines to add back — noon-ET
+openers, kickoff-time runs — when the budget allows). A scheduled run with no
 webhook secret exits *before* pulling (0 credits), so the schedule can sit on `main` until
 you add the secret. GitHub cron is UTC, so the file's comments carry the conversion; after the November
 clock change every run lands an hour earlier on your wall clock, which still covers the 1pm /
@@ -408,7 +409,7 @@ tests/            offline pytest suite (pricing math, ratings, walk-forward, adj
   backtest.yml    manual walk-forward backtest -> job summary
   props-scan.yml  manual-only prop scan -> job summary + CSV artifact (never scheduled: quota)
   ev-scan.yml     manual-only +EV / arbs & middles scan (3 credits) -> job summary + CSV artifact
-  alerts.yml      game-day cron (16 runs/week x 3 credits) + manual: alerts.py -> Discord / Telegram
+  alerts.yml      game-day cron (12 runs/week x 3 credits) + manual: alerts.py -> Discord / Telegram
 ```
 
 ### The number pipeline for one game

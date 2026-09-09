@@ -384,7 +384,7 @@ def _expand(field, lo, hi):
     return out
 
 
-def test_alerts_workflow_parses_and_schedule_is_16_runs_a_week():
+def test_alerts_workflow_parses_and_schedule_is_12_runs_a_week():
     with open(os.path.join(ROOT, ".github", "workflows", "alerts.yml"), encoding="utf-8") as f:
         raw = f.read()
     wf = yaml.safe_load(raw)
@@ -406,7 +406,7 @@ def test_alerts_workflow_parses_and_schedule_is_16_runs_a_week():
         hours, days = _expand(hour, 0, 23), _expand(dow, 0, 6)
         assert max(hours) <= 23 and max(days) <= 6
         runs += len(hours) * len(days)
-    assert runs == 16                                                               # 9+1 Sun/SNF + 2 TNF + 2 MNF + 2 openers
+    assert runs == 12                                                               # 9+1 Sun/SNF + 1 TNF + 1 MNF pregame
     assert runs * credits_per_run("core") * 52 / 12 < 220                             # ~210 credits/month of the free 500
     assert "0 0 * * 1" in crons and "0 13-21 * * 0" in crons                         # SNF wraps into Monday UTC
     steps = wf["jobs"]["alerts"]["steps"]
@@ -421,5 +421,5 @@ def test_alerts_workflow_parses_and_schedule_is_16_runs_a_week():
     guard = scan_step["run"].split("python alerts.py")[0]
     assert '"$GITHUB_EVENT_NAME" = "schedule"' in guard and "DISCORD_WEBHOOK" in guard and "exit 0" in guard
     assert "GITHUB_STEP_SUMMARY" in raw and "git push" not in raw and "git commit" not in raw
-    assert "3 credits" in raw and "16 runs/week" in raw and "markets x regions" in raw.lower()   # the credit math stays documented
+    assert "3 credits" in raw and "12 runs/week" in raw and "markets x regions" in raw.lower()   # the credit math stays documented
     assert "1 credit" not in raw.replace("1 credit per market", "")                   # the old "one credit per run" claim is gone

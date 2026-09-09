@@ -80,8 +80,8 @@ Setup (the secrets are yours to add; click-by-click in README → *Alerts*):
    gets the current top pick. Done; the schedule takes over from there.
 
 Quota: every run is 3 credits (3 markets × 10 named books, Pinnacle included). The schedule
-is Sunday hourly 9am–5pm ET plus 8pm (SNF), Thursday and Monday at 7pm and 8pm ET, and noon
-ET Tuesday and Friday = 16 runs, 48 credits/week (~210/month), which fits under the free 500
+is Sunday hourly 9am–5pm ET plus 8pm (SNF), and 7pm ET Thursday and Monday for TNF / MNF
+= 12 runs, 36 credits/week (~155/month), which fits under the free 500
 next to the dashboard's `MAX_CREDITS_PER_DAY`. A scheduled run with no webhook secret exits
 before pulling (0 credits). To pause,
 comment out the `schedule:` block in `alerts.yml`; to tune, edit the input defaults there

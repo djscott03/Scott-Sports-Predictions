@@ -6,3 +6,4 @@ requests
 streamlit
 streamlit-autorefresh
 tzdata
+pyyaml

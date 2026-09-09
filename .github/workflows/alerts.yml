@@ -9,11 +9,12 @@
 # the sharp anchor), so every scheduled run below is 3 credits and has to earn it:
 #   Sunday    hourly 13:00-21:00 UTC   (9am-5pm ET: inactives, the 1pm and 4pm kicks)      9 runs
 #   Sunday    00:00 UTC Monday         (8pm ET: SNF pregame)                                1 run
-#   Thursday  23:00 UTC + 00:00 Fri    (7pm + 8pm ET: TNF pregame and kickoff)              2 runs
-#   Monday    23:00 UTC + 00:00 Tue    (7pm + 8pm ET: MNF pregame and kickoff)              2 runs
-#   Tue, Fri  16:00 UTC                (noon ET: the week's openers / pre-weekend moves)    2 runs
-#                                           = 16 runs/week x 3 credits = 48/week, ~210 credits/month
-# That leaves ~290/month for the dashboard and the manual ev / props scans -- and the dashboard's pulls bill the
+#   Thursday  23:00 UTC                (7pm ET: TNF pregame)                                1 run
+#   Monday    23:00 UTC                (7pm ET: MNF pregame)                                1 run
+#                                           = 12 runs/week x 3 credits = 36/week, ~155 credits/month
+# (The first month started with a 9-credit-a-pull dashboard and 274 credits were left on 2026-09-09, so this is
+# the thin version; add "0 16 * * 2,5" for noon-ET openers, or TNF/MNF kickoff lines, when the budget allows.)
+# That leaves ~345/month for the dashboard and the manual ev / props scans -- and the dashboard's pulls bill the
 # same way (3 a pull at its 'core' default), which is what MAX_CREDITS_PER_DAY counts. To pause, comment out
 # the `schedule:` block; to spend less, delete cron lines (Sunday is the one that matters). `books` = wide
 # adds Hard Rock / BetUS / LowVig / MyBookie / betPARX / Bally / Fliff ... at 6 credits a run -- halve the schedule.
@@ -49,11 +50,7 @@ on:
     - cron: "0 13-21 * * 0"      # Sunday 13:00-21:00 UTC (9am-5pm ET): inactives, 1pm and 4pm kicks
     - cron: "0 0 * * 1"          # Sunday 8pm ET = Monday 00:00 UTC (SNF pregame)
     - cron: "0 23 * * 4"         # Thursday 23:00 UTC (7pm ET, TNF pregame)
-    - cron: "0 0 * * 5"          # Thursday 8pm ET = Friday 00:00 UTC (TNF kickoff)
     - cron: "0 23 * * 1"         # Monday 23:00 UTC (7pm ET, MNF pregame)
-    - cron: "0 0 * * 2"          # Monday 8pm ET = Tuesday 00:00 UTC (MNF kickoff)
-    - cron: "0 16 * * 2"         # Tuesday 16:00 UTC (noon ET): the week's openers
-    - cron: "0 16 * * 5"         # Friday 16:00 UTC (noon ET): mid-week moves before the weekend
 
 # a manual "Run workflow" that lands on top of a scheduled run queues behind it instead of both restoring the same
 # state and sending the same message twice
