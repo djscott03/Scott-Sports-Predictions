@@ -1,0 +1,122 @@
+# Alerts: pull the game-line board once and push anything NEW -- arbs, free middles, +EV middles, the top +EV
+# picks -- to Discord and/or Telegram (alerts.py). Dedupe lives in alerts_state.json, carried from run to run by
+# actions/cache; nothing is ever committed.
+#
+# Credit math -- the free Odds API tier is 500 credits/month and the owner will not pay. The game-line endpoint
+# bills MARKETS x REGIONS per call, and every group of 10 NAMED bookmakers counts as one region (the-odds-api.com
+# quota docs; measured on the 2026-09-06 ev-scan Action runs: 500 -> 491 -> 474 with the old us,us2,eu default
+# = 9 a pull). alerts.py pulls h2h + spreads + totals for --books core (odds.CORE_BOOKS: 10 books incl. Pinnacle,
+# the sharp anchor), so every scheduled run below is 3 credits and has to earn it:
+#   Sunday    hourly 13:00-21:00 UTC   (9am-5pm ET: inactives, the 1pm and 4pm kicks)      9 runs
+#   Sunday    00:00 UTC Monday         (8pm ET: SNF pregame)                                1 run
+#   Thursday  23:00 UTC + 00:00 Fri    (7pm + 8pm ET: TNF pregame and kickoff)              2 runs
+#   Monday    23:00 UTC + 00:00 Tue    (7pm + 8pm ET: MNF pregame and kickoff)              2 runs
+#   Tue, Fri  16:00 UTC                (noon ET: the week's openers / pre-weekend moves)    2 runs
+#                                           = 16 runs/week x 3 credits = 48/week, ~210 credits/month
+# That leaves ~290/month for the dashboard and the manual ev / props scans -- and the dashboard's pulls bill the
+# same way (3 a pull at its 'core' default), which is what MAX_CREDITS_PER_DAY counts. To pause, comment out
+# the `schedule:` block; to spend less, delete cron lines (Sunday is the one that matters). `books` = wide
+# adds Hard Rock / BetUS / LowVig / MyBookie / betPARX / Bally / Fliff ... at 6 credits a run -- halve the schedule.
+# A SCHEDULED run with no DISCORD_WEBHOOK / TELEGRAM_BOT_TOKEN secret exits before the pull (0 credits), so this
+# file can sit on main before the webhook exists; manual runs always pull.
+# GitHub cron is UTC only and a window that crosses midnight is split into two lines, because the day of the
+# week changes at 00:00 UTC: Sunday 8pm ET is "0 0 * * 1" (Monday in UTC), never "0 13-23,0 * * 0".
+# The ET times above assume daylight time (UTC-4); after the November clock change everything lands an hour
+# earlier on the wall clock (8am-4pm ET on Sunday, 7pm for SNF), which still covers the 1pm / 4pm / SNF windows.
+name: alerts
+
+on:
+  workflow_dispatch:
+    inputs:
+      league:
+        description: "nfl or cfb"
+        default: "nfl"
+      test:
+        description: "true = send the current top pick regardless of what was already alerted (checks the webhook wiring)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+      min_ev:
+        description: "min EV % for a +EV pick to be alerted"
+        default: "2.0"
+      hours:
+        description: "only games kicking off within this many hours (240 = a Tue-Mon slate)"
+        default: "240"
+      books:
+        description: "core (10 books incl. Pinnacle = 3 credits), wide (20 = 6), or a comma list of Odds API book keys"
+        default: "core"
+  schedule:
+    - cron: "0 13-21 * * 0"      # Sunday 13:00-21:00 UTC (9am-5pm ET): inactives, 1pm and 4pm kicks
+    - cron: "0 0 * * 1"          # Sunday 8pm ET = Monday 00:00 UTC (SNF pregame)
+    - cron: "0 23 * * 4"         # Thursday 23:00 UTC (7pm ET, TNF pregame)
+    - cron: "0 0 * * 5"          # Thursday 8pm ET = Friday 00:00 UTC (TNF kickoff)
+    - cron: "0 23 * * 1"         # Monday 23:00 UTC (7pm ET, MNF pregame)
+    - cron: "0 0 * * 2"          # Monday 8pm ET = Tuesday 00:00 UTC (MNF kickoff)
+    - cron: "0 16 * * 2"         # Tuesday 16:00 UTC (noon ET): the week's openers
+    - cron: "0 16 * * 5"         # Friday 16:00 UTC (noon ET): mid-week moves before the weekend
+
+# a manual "Run workflow" that lands on top of a scheduled run queues behind it instead of both restoring the same
+# state and sending the same message twice
+concurrency:
+  group: alerts
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  alerts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      # the dedupe state from the previous run: the exact key never exists (new run id), so the prefix picks
+      # the most recent save; no cache yet = first run = everything on the board is new
+      - uses: actions/cache/restore@v4
+        with:
+          path: alerts_state.json
+          key: alerts-state-${{ github.run_id }}
+          restore-keys: alerts-state-
+      # inputs are free text: passed through env vars, quoted, never interpolated into the shell; on a scheduled
+      # run the inputs context is empty and the `||` defaults apply. A scheduled run with nowhere to deliver to
+      # stops before spending anything (the message would only land in this log).
+      - name: scan and alert (3 markets x 10 books = 3 credits with books=core)
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LEAGUE: ${{ inputs.league || 'nfl' }}
+          MIN_EV: ${{ inputs.min_ev || '2.0' }}
+          HOURS: ${{ inputs.hours || '240' }}
+          BOOKS: ${{ inputs.books || 'core' }}
+          TEST: ${{ inputs.test || 'false' }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ -z "$DISCORD_WEBHOOK" ] && [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "no DISCORD_WEBHOOK / TELEGRAM_BOT_TOKEN secret yet: scheduled run skipped before the pull (0 credits)"
+            echo "**skipped: no delivery secret configured (0 credits spent)**" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$TEST" = "true" ]; then
+            python alerts.py "$LEAGUE" --min-ev "$MIN_EV" --hours "$HOURS" --books "$BOOKS" --test
+          else
+            python alerts.py "$LEAGUE" --min-ev "$MIN_EV" --hours "$HOURS" --books "$BOOKS"
+          fi
+      # save the state even when the scan failed (the restored file is re-saved unchanged); a --test run or a
+      # first run that crashed before writing leaves no file, so save an empty one rather than fail the step
+      - name: keep the dedupe state
+        if: always()
+        run: '[ -f alerts_state.json ] || echo "{}" > alerts_state.json'
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: alerts_state.json
+          key: alerts-state-${{ github.run_id }}
+      - name: job summary
+        if: always()
+        run: |
+          if [ -f alerts_summary.md ]; then cat alerts_summary.md >> "$GITHUB_STEP_SUMMARY"; fi

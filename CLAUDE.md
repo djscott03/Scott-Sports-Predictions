@@ -38,6 +38,16 @@ run.py                     CLI: backtest | predict | ev (--csv --hours --exclude
                            ARBS & MIDDLES -> middles_*.csv) | props (--csv --markets --hours --credits --weight
                            --exclude --nomodel; board, then PROP ARBS & MIDDLES -> props_middles_*.csv);
                            --exclude takes book keys or 'nonus' (odds.NON_US_BOOKS)
+alerts.py                  CLI: alerts.py <league> [--csv] [--hours 240] [--min-ev 2.0] [--min-middle-ev 1.0]
+                           [--max-age 45] [--exclude nonus] [--state alerts_state.json] [--top 5] [--test] [--dry-run].
+                           One board pull -> scan (market-only, odds.fresh at --max-age) -> alertable items in order:
+                           guaranteed_pct >= 0 pairs (always), middles >= --min-middle-ev %, top picks >= --min-ev %
+                           -> dedupe against the state JSON {key: first_seen_iso} (24 h TTL; key = pick|matchup|
+                           market|team|line|book|price or mid|bet_a|bet_b) -> Discord (DISCORD_WEBHOOK) / Telegram
+                           (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID), chunked at 1900 chars, friendly BOOK_NAMES
+                           (copied from app.py: never import app.py, it imports streamlit). Always prints the
+                           message and writes alerts_summary.md; state saved after delivery succeeds (a failed
+                           webhook exits 1 with the state untouched); --test sends the top pick and never writes.
 holdout.py                 fit blend weight on early seasons, confirm on held-out ones
 publish_card.py            auto-detect week -> predictions/<league>/<season>_wNN.{md,csv} + graded README index
 app.py                     Streamlit dashboard, Cleveland theme (.streamlit/config.toml + CSS block). Tabs: top picks
@@ -48,19 +58,26 @@ app.py                     Streamlit dashboard, Cleveland theme (.streamlit/conf
                            prop middles + prop odds screen under the board]. Hero pills + 'Right now' cards (best
                            +EV line, best arb/middle, board status); price_board cached on sidebar settings +
                            fetched_at. SHARPMODEL_DEMO_ODDS=<odds_*.csv> runs it off a file (no key, no credits).
-                           Sharing guards: SCAN_PIN (gates props scans + force refresh), MAX_PULLS_PER_DAY (default
-                           24; st.cache_resource budget, then the last board is served 'paused' till midnight NY).
+                           Sharing guards: SCAN_PIN (gates props scans + force refresh), MAX_CREDITS_PER_DAY (default
+                           60; st.cache_resource budget counting each pull's x-requests-last, 3 at ODDS_BOOKS=core;
+                           then the last board is served 'paused' till midnight NY).
                            Sidebar Filters: min EV, window, markets, Teams, Books (pretty names -> extra exclusions),
                            raw exclude box. Never override font-family globally: Material icons become their names.
 lines_template.csv         --csv schema for game lines;  props_template.csv  --csv schema for props (both tracked)
-tests/                     offline pytest (95 tests, ~8s; incl. AppTest smoke + subprocess runs of run.py ev/props);
-                           conftest chdir's to repo root
+tests/                     offline pytest (110 tests, ~15s; incl. AppTest smoke + subprocess runs of run.py ev/props
+                           and alerts.py --dry-run / --test; test_alerts.py also parses alerts.yml and counts its
+                           cron runs); conftest chdir's to repo root
 .github/workflows/ci.yml           pytest on push/PR (python 3.12)
 .github/workflows/weekly-card.yml  cron Tue+Thu 13:00 UTC + manual dispatch; commits predictions/
 .github/workflows/backtest.yml     manual dispatch; backtest -> job summary + csv artifact
 .github/workflows/props-scan.yml   manual dispatch ONLY (quota); run.py nfl props -> job summary + csv artifact
-.github/workflows/ev-scan.yml      manual dispatch ONLY (1 credit); run.py <league> ev -> +EV + arbs & middles
+.github/workflows/ev-scan.yml      manual dispatch ONLY (3 credits); run.py <league> ev -> +EV + arbs & middles
                                    in the job summary + csv artifact; never commits
+.github/workflows/alerts.yml       alerts.py on a CONSERVATIVE UTC cron (Sun hourly 13-01, Thu+Mon hourly 22-02,
+                                   Tue-Sat 16:00 = 28 credits/week, ~120/month; windows past midnight are split into
+                                   two cron lines because day-of-week flips at 00:00 UTC) + manual dispatch (league,
+                                   test, min_ev, hours); alerts_state.json rides actions/cache (restore-keys prefix
+                                   alerts-state-, save if: always()); summary appended to the job summary; never commits
 ```
 
 ## Key design decisions (don't undo these)
@@ -75,12 +92,17 @@ tests/                     offline pytest (95 tests, ~8s; incl. AppTest smoke + 
   lines) only while *none* of its games have kicked off; once any game has a result the
   existing card is kept and only the graded index is regenerated. Never commit a week
   that was priced *after* its games were played (that's a backtest, not a prediction).
-- Odds API free tier = 500 req/month → `REFRESH_MIN >= 20` in the dashboard; each
-  refresh is one request regardless of viewers.
+- **Credits = markets × regions, or markets × ceil(named books / 10).** The Odds API bills a
+  game-line pull that way (docs re-read 2026-09-09; the first live pulls with the old us,us2,eu
+  default cost 9 each: 500 → 491 → 474). `fetch_odds(books="core")` names `odds.CORE_BOOKS`
+  (10 incl. Pinnacle, the sharp anchor) = 3 credits and records `attrs["cost"]` from
+  x-requests-last; 'wide' = 20 books = 6. Never call it with regions unless you mean 9. Free
+  tier = 500/month → `REFRESH_MIN >= 20` in the dashboard; each refresh is one pull (3 credits)
+  regardless of viewers, capped by MAX_CREDITS_PER_DAY.
 - Odds API team names → nflverse abbreviations via `NFL_NAMES` in odds.py; CFB uses
   longest-prefix match against CFBD school names.
 - **Props are never fetched automatically.** The per-event endpoint bills games × markets ×
-  regions per scan (vs 1 credit for the whole game-line board), so `fetch_props` refuses
+  regions per scan (vs 3 credits for the whole game-line board), so `fetch_props` refuses
   above `max_credits`, refuses up front when `remaining` (from the free events call) minus one
   call would breach the 50-credit reserve, and stops under the reserve mid-scan; run.py prints
   the estimate first, the Props tab shows it on the button, and props-scan.yml is
@@ -125,6 +147,15 @@ tests/                     offline pytest (95 tests, ~8s; incl. AppTest smoke + 
   through), not every book x book: the full 272-game board prices in ~2 s instead of ~33 s. The first
   Streamlit Cloud deploy (2026-09-06) sat on "running" for that half-minute — that is what this fixes.
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
+- **Alerts are one 3-credit pull per run and dedupe by content, not by time.** `alerts.py` keys a pick on
+  matchup|market|team|line|book|price and a middle on its two `bet_a|bet_b` strings (raw book keys), so
+  a re-price is a new alert and the same number is never sent twice within 24 h; the state is saved
+  only after delivery succeeded (a dead webhook = exit 1, nothing remembered, re-sent next run) and
+  `--test` never writes it. The state file lives in the Action's cache (`alerts-state-<run_id>`,
+  restored by prefix), never in git. The cron is 16 runs x 3 = 48 credits/week on purpose: the owner will not pay
+  for the API, so every scheduled line in alerts.yml has to justify itself in the header comment; do
+  not add a `*/5` schedule. Book names come from `alerts.BOOK_NAMES`, a copy of app.py's table --
+  importing app.py would pull streamlit onto the runner.
 
 ## Verified state (2026-09-05, local .venv on python 3.9; CI uses 3.12)
 - `python -m pytest -q tests` → 95 passed in ~8s (15 original + props projections/pricing,
@@ -163,7 +194,8 @@ tests/                     offline pytest (95 tests, ~8s; incl. AppTest smoke + 
 - Grading path verified by publishing a finished 2025 week and confirming W-L-P/units, then deleted.
 - `app.py` passes `streamlit.testing.v1.AppTest` with no key (shows the warning, no exceptions).
 - **Live Odds API verified 2026-09-05** via the `ev scan` and `props scan` Actions (secrets set
-  by the owner): `fetch_odds` -> 272 events / 35 books / 5,394 prices, 1 credit; `fetch_events`
+  by the owner): `fetch_odds` -> 272 events / 35 books / 5,394 prices — 9 credits with the all-regions
+  default of the time (since 2026-09-09 it names CORE_BOOKS: 3 credits, verify with attrs['cost']); `fetch_events`
   + `fetch_props` on 2 games x 4 markets cost exactly 4 per call (`x-requests-last`), 483 credits
   left afterwards. `parse_odds_json` / `parse_props_json` matched the real v4 shape. Findings that
   drove the same-day changes: (1) with `--weight 0.25` the +EV board was the model disagreeing
@@ -184,11 +216,25 @@ tests/                     offline pytest (95 tests, ~8s; incl. AppTest smoke + 
 - Props tab verified with `AppTest` + a faked `requests.get` (tests/test_app.py): page load makes
   no per-event call, the button label carries the estimate, one click bills exactly one call,
   the raw frame and the board land in `session_state`, and a second `at.run()` makes no call.
+- 2026-09-06 alerts (`alerts.py`, `alerts.yml`, `tests/test_alerts.py`, 10 offline tests): every item
+  type rendered with friendly names (ML arb `🔒 ARB +2.44% locked … split 51/49`, even-money total
+  `🟢 FREE MIDDLE +7.7% EV … window 45-46 · hits 8%`, −2.5/+3.5 `🎯 MIDDLE +3.0% EV … hits 8%, miss
+  costs 4.5%`, −2.5/+3 `½ HALF MIDDLE … window 3p`, `💰 +EV 6.2% · PIT -3.5 +105 @ Hard Rock OH (fair
+  -107) · also Bovada +100, BetUS +100 · Sun 1:00PM`); dedupe (second run nothing, re-price new key,
+  24 h expiry, bad JSON tolerated); chunking at 1900; Discord / Telegram payloads with a monkeypatched
+  `requests.post` and no URL / token in any raised message; `alerts.py nfl --csv lines_template.csv
+  --dry-run` via subprocess sends the FanDuel U 48.5 pick (+3.3%), writes the state + summary, exits 0,
+  and says `nothing new` on the second run; `--test` never writes state; a dead webhook exits 1 with
+  no state; the YAML parses, 7 cron lines x 5 fields, no `23,0` wraps, exactly 28 runs/week. The
+  Action itself has NOT run yet: the owner adds `DISCORD_WEBHOOK` (README → Alerts), then Actions →
+  alerts → Run workflow → test=true.
 
 ## Backlog (owner's roadmap, rough priority)
 1. ~~Add secrets; deploy app.py to Streamlit Cloud~~ — DONE 2026-09-05/06: secrets set by the owner,
    app live at scott-sports-predictions-dg3viypucz4nyba8clzscc.streamlit.app (auto-redeploys on push to main)
-2. Telegram/Discord alert on new +EV line (Option B in DEPLOY.md)
+2. ~~Telegram/Discord alert on new +EV line~~ — DONE 2026-09-06/09: `alerts.py` + `alerts.yml` (16 runs/week
+   on game days x 3 credits ≈ 210/month, dedupe state in the Action cache); the owner still has to add the
+   `DISCORD_WEBHOOK` secret and fire the test run (README → Alerts, DEPLOY.md → Option B)
 3. ~~Run the same backtest on CFB~~ — DONE 2026-09-05 (50.4% ATS, see verified state); next
    is a CFB `ev`/middles scan, not ratings work
 4. QB starter-vs-backup point-value table; auto-apply instead of flag

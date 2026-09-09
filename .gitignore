@@ -10,3 +10,6 @@ __pycache__/
 !lines_template.csv
 !props_template.csv
 !predictions/**/*.csv
+# alerts.py scratch (the Action carries the state in its cache)
+alerts_state.json
+alerts_summary.md

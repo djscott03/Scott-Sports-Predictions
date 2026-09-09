@@ -29,14 +29,20 @@ import pandas as pd
 from scipy.stats import poisson
 from .pricing import LEAGUE_SD, decimal_from_american
 from .margins import NFL_SD, NFL_KEY_WEIGHTS, margin_pmf
-from .odds import blended_fair
+from .odds import blended_fair, add_age
 from .props import normalize_player
+
+
+def _older(x, y) -> float:
+    """The older leg's age in minutes (NaN only when neither leg has a timestamp)."""
+    xs = [v for v in (x, y) if v is not None and not pd.isna(v)]
+    return max(xs) if xs else np.nan
 
 DISTS = ("nfl_margin", "normal", "poisson", "bernoulli")
 FAIR_COLS = ["event_id", "market", "player", "mu", "sd", "dist"]
 COLS = ["commence", "matchup", "market", "player", "type", "bet_a", "bet_b", "window", "p_middle",
         "miss_cost_pct", "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p",
-        "stake_a_pct", "stake_b_pct", "same_book", "n_alt", "alt",
+        "stake_a_pct", "stake_b_pct", "same_book", "n_alt", "alt", "age_min",
         "event_id", "book_a", "line_a", "price_a", "book_b", "line_b", "price_b"]      # machine columns last
 SIDE_A = {"home", "over", "yes"}          # side A wins when the number goes UP
 SIDE_B = {"away", "under", "no"}          # side B wins when it goes DOWN
@@ -192,6 +198,7 @@ def find_middles(odds: pd.DataFrame, fairs: pd.DataFrame, league: str = "nfl", m
     if odds is None or len(odds) == 0 or fairs is None or len(fairs) == 0: return pd.DataFrame(columns=COLS)
     fk = {(r.event_id, r.market, _pkey(r.player)): (float(r.mu), r.sd, r.dist) for r in fairs.itertuples()}
     o = odds.reset_index(drop=True).drop_duplicates()
+    if "age_min" not in o: o = add_age(o)                         # minutes since each leg's book last moved
     o["_pkey"] = o.player.map(_pkey) if "player" in o else ""
     o["line"] = pd.to_numeric(o.line, errors="coerce") if "line" in o else np.nan
     o["price"] = pd.to_numeric(o.price, errors="coerce").astype(float)   # stable dtype whether or not a blank is dropped
@@ -230,6 +237,7 @@ def find_middles(odds: pd.DataFrame, fairs: pd.DataFrame, league: str = "nfl", m
                 ev_pct=100 * r["ev"], guaranteed_pct=100 * r["guaranteed"],
                 breakeven_p=miss / (win + miss) if win + miss > 0 else np.nan,
                 stake_a_pct=100 * r["stake_a"], stake_b_pct=100 * r["stake_b"], same_book=same, n_alt=0, alt="",
+                age_min=_older(getattr(a, "age_min", np.nan), getattr(b, "age_min", np.nan)),   # the older leg's age
                 event_id=eid, book_a=a.book, line_a=a.line, price_a=a.price,
                 book_b=b.book, line_b=b.line, price_b=b.price)
 

@@ -1,6 +1,7 @@
 # Multi-book +EV scan (game lines: spreads / totals / moneylines) plus the cross-book
 # ARBS & MIDDLES pass on GitHub's runner. MANUAL ONLY -- never add a schedule: every run
-# bills 1 credit from the free 500/month Odds API tier (needs the ODDS_API_KEY repo secret;
+# bills 3 credits (3 markets x 10 named books, Pinnacle included; 'wide' = 20 books = 6)
+# from the free 500/month Odds API tier (needs the ODDS_API_KEY repo secret;
 # league=cfb also needs CFBD_API_KEY for the team-name map). The tables land in the run's
 # job summary and the CSVs as a downloadable artifact; nothing is committed.
 name: ev scan
@@ -26,6 +27,9 @@ on:
       weight:
         description: "model blend weight for the fair number; 0 = sharp-book market only (stale lines), 0.25 = the CLI default"
         default: "0"
+      books:
+        description: "core (10 books incl. Pinnacle = 3 credits), wide (20 = 6), or a comma list of Odds API book keys"
+        default: "core"
 
 permissions:
   contents: read
@@ -41,7 +45,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       # inputs are free text: pass them through env vars, quoted, never interpolated into the shell
-      - name: scan +EV lines, arbs & middles (1 credit)
+      - name: scan +EV lines, arbs & middles (3 credits with books=core)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
           CFBD_API_KEY: ${{ secrets.CFBD_API_KEY }}
@@ -51,8 +55,9 @@ jobs:
           HOURS: ${{ inputs.hours }}
           EXCLUDE: ${{ inputs.exclude }}
           WEIGHT: ${{ inputs.weight }}
+          BOOKS: ${{ inputs.books || 'core' }}
         run: |
-          python run.py "$LEAGUE" ev "$SEASON" "$WEEK" --hours "$HOURS" --exclude "$EXCLUDE" --weight "$WEIGHT"
+          python run.py "$LEAGUE" ev "$SEASON" "$WEEK" --hours "$HOURS" --exclude "$EXCLUDE" --weight "$WEIGHT" --books "$BOOKS"
       - name: job summary
         env:
           SEASON: ${{ inputs.season }}

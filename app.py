@@ -24,7 +24,7 @@ import streamlit as st
 
 from sharpmodel import SharpModel, load_nfl, load_cfb, props
 from sharpmodel.odds import (fetch_odds, find_ev, best_lines, parse_odds_json, fetch_events, fetch_props, within_hours,
-                             odds_grid, load_odds_csv, NON_US_BOOKS, top_picks,
+                             odds_grid, load_odds_csv, NON_US_BOOKS, top_picks, add_age, fresh, STALE_MIN, odds_credits,
                              estimate_prop_credits, PROP_MARKETS_DEFAULT, PROP_MARKETS_ALL)
 from sharpmodel.props import load_player_weeks, project_players, fit_dispersion, price_props
 from sharpmodel.middles import find_middles, game_fairs, prop_fairs
@@ -43,7 +43,9 @@ CFBD_KEY = secret("CFBD_API_KEY")
 REFRESH_MIN = int(secret("REFRESH_MIN", 20))
 DEMO_ODDS = secret("SHARPMODEL_DEMO_ODDS")
 PIN = secret("SCAN_PIN")                              # set before sharing the link: gates props scans + force refresh
-MAX_PULLS = int(secret("MAX_PULLS_PER_DAY", 24))      # board pulls per day (1 credit each); then the odds freeze till midnight
+MAX_CREDITS = int(secret("MAX_CREDITS_PER_DAY", 60))  # board credits per day (3 per pull at 'core'); then the odds freeze
+ODDS_BOOKS = secret("ODDS_BOOKS", "core")             # 'core' (10 books incl. Pinnacle, 3 credits/pull), 'wide' (20, 6), or a list
+PULL_COST = odds_credits(books=ODDS_BOOKS)            # the estimate; the API's x-requests-last replaces it after the first pull
 
 # -------- look --------
 # Cleveland palette: Browns orange #FF3C00 / brown #311D00, Cavs wine #860038 / gold #FDBB30. Icon fonts are left
@@ -128,6 +130,10 @@ with filters:
     min_ev = st.slider("Min EV %", 0.0, 8.0, 1.5, 0.5) / 100
     hours = st.number_input("Kickoff within (hours)", 1, 2000, 240,
                             help="The API posts the whole season; 240 h = a full Tue-Mon slate.")
+    max_age = st.number_input("Hide prices older than (min)", 0, 600, STALE_MIN, 5,
+                              help="Minutes since the book last changed that price. A number nobody has touched "
+                                   "in 45 min while the sharp books moved is usually gone by the time you click. "
+                                   "0 = show everything.")
     markets = st.multiselect("Markets", ["spreads", "totals", "ml"], ["spreads", "totals", "ml"], format_func=market)
     books_excl = st.text_input("Exclude books (comma sep)", "nonus",
                                help="Books you cannot bet at are dropped as +EV rows and as arb/middle legs but still "
@@ -163,22 +169,23 @@ def model_card(league, season, week):
 
 @st.cache_resource
 def pull_budget():
-    """Process-wide: pulls today and the last board. Shared by every viewer -- the point is that a link passed
-    around cannot spend more than MAX_PULLS credits a day on the game-line board."""
-    return {"day": None, "n": 0, "last": None}
+    """Process-wide: credits spent today, the last pull's cost and the last board. Shared by every viewer -- the point
+    is that a link passed around cannot spend more than MAX_CREDITS a day on the game-line board."""
+    return {"day": None, "spent": 0, "cost": PULL_COST, "last": None}
 
 @st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Pulling odds from every book…")
 def load_odds(league, season):
-    """-> (odds, fetched_at, credits_remaining, paused). Demo file, or the live board (1 credit), or empty without a
-    key. Past the daily budget the last board is served unchanged (paused=True) until the New York date changes."""
+    """-> (odds, fetched_at, credits_remaining, paused). Demo file, or the live board (PULL_COST credits: 3 markets x
+    ceil(books/10)), or empty without a key. Past the daily budget the last board is served unchanged (paused=True)
+    until the New York date changes."""
     if DEMO_ODDS:
         return load_odds_csv(DEMO_ODDS), time.time(), None, False
     if not ODDS_KEY:
         return pd.DataFrame(), time.time(), None, False
     b, today = pull_budget(), pd.Timestamp.now(tz="America/New_York").date()
     if b["day"] != today:
-        b["day"], b["n"] = today, 0
-    if b["n"] >= MAX_PULLS:
+        b["day"], b["spent"] = today, 0
+    if b["spent"] + b["cost"] > MAX_CREDITS:                          # the next pull would breach the day's budget
         if b["last"] is not None:
             df, ts, rem = b["last"]
             return df, ts, rem, True
@@ -186,22 +193,28 @@ def load_odds(league, season):
     known = None
     if league == "cfb":
         h = load_hist(league, season); known = sorted(set(h.home) | set(h.away))
-    df = fetch_odds(league, api_key=ODDS_KEY, known_teams=known)
-    b["n"] += 1
+    df = fetch_odds(league, api_key=ODDS_KEY, known_teams=known, books=ODDS_BOOKS)
+    b["cost"] = df.attrs.get("cost") or b["cost"]                      # what the API actually billed
+    b["spent"] += b["cost"]
     b["last"] = (df, time.time(), df.attrs.get("remaining"))
     return df, time.time(), df.attrs.get("remaining"), False
 
 @st.cache_data(ttl=60 * REFRESH_MIN, show_spinner="Pricing the board…")
-def price_board(league, season, week, model_w, min_ev, markets, excl, hours, teams, fetched_at, model_fair):
+def price_board(league, season, week, model_w, min_ev, markets, excl, hours, teams, max_age, fetched_at, model_fair):
     """+EV rows and arbs/middles for the sidebar settings. Keyed on fetched_at so a fresh odds pull re-prices;
-    otherwise a slider change is a cache hit, not a 30 s recompute. Excluded books still anchor the fairs."""
+    otherwise a slider change is a cache hit, not a 30 s recompute. Excluded books still anchor the fairs; prices
+    older than max_age minutes are hidden from the plays (0 = keep all)."""
     odds, _, _, _ = load_odds(league, season)
-    odds = within_hours(odds[odds.market.isin(list(markets))], hours)
+    odds = add_age(within_hours(odds[odds.market.isin(list(markets))], hours), now=fetched_at_ts(fetched_at))
     if teams: odds = odds[odds.home.isin(teams) | odds.away.isin(teams)]
     ev = find_ev(odds, league, model_fair=model_fair, model_weight=model_w, min_ev=min_ev)
     if excl and len(ev): ev = ev[~ev.book.isin(excl)].reset_index(drop=True)
     mids = find_middles(odds, game_fairs(odds, league, model_fair, model_w), league, exclude=list(excl))
-    return odds, ev, mids
+    return odds, fresh(ev, max_age), fresh(mids, max_age)
+
+def fetched_at_ts(fetched_at):
+    """Ages are measured at pull time, not render time: a cached board must not age between reruns."""
+    return pd.Timestamp(fetched_at, unit="s", tz="UTC")
 
 @st.cache_data(ttl=60 * 30, show_spinner="Listing upcoming games (free endpoint)…")
 def load_events(league):
@@ -225,6 +238,10 @@ def kickoff(s):
 def age_text(minutes):
     return "just now" if minutes < 1 else f"{minutes:.0f} min ago"
 
+def age_col(s):
+    """'12m' per price row; blank when the feed has no timestamp (hand CSV)."""
+    return s.map(lambda x: "" if pd.isna(x) else ("<1m" if x < 1 else f"{x:.0f}m"))
+
 def pinned(cfg_cls, label, **kw):
     """column_config with pinned=True where this Streamlit supports it (1.5x+); plain otherwise."""
     try: return cfg_cls(label, pinned=True, **kw)
@@ -232,12 +249,12 @@ def pinned(cfg_cls, label, **kw):
 
 # -------- views --------
 NO_KEY = "No odds loaded. Add ODDS_API_KEY in Streamlit secrets (free at the-odds-api.com)."
-MID_COLS = ["commence", "matchup", "market", "player", "type", "bet_a", "bet_b", "window", "p_middle", "miss_cost_pct",
-            "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "stake_a_pct", "stake_b_pct", "alt"]
+MID_COLS = ["commence", "matchup", "market", "player", "type", "bet_a", "bet_b", "age", "window", "p_middle",
+            "miss_cost_pct", "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "stake_a_pct", "stake_b_pct", "alt"]
 MID_NAMES = {"bet_a": "leg A", "bet_b": "leg B", "p_middle": "middle %", "miss_cost_pct": "miss cost %",
              "win_both_pct": "win both %", "ev_pct": "EV %", "guaranteed_pct": "guaranteed %",
              "breakeven_p": "breakeven %", "stake_a_pct": "stake A %", "stake_b_pct": "stake B %",
-             "alt": "same numbers also at"}
+             "alt": "same numbers also at", "age": "updated"}
 MID_NOTE = ("Two legs at two books, stakes split so a miss (the sides split) costs the same either way; every % is of "
             "the total stake. The middle lands when the number finishes inside the window and both legs cash "
             "(win both %); miss cost % is what a miss loses; breakeven % is the middle probability that covers it and "
@@ -265,6 +282,9 @@ def ev_cfg(max_ev):
             "kelly_stake": st.column_config.NumberColumn("Stake %", format="%.2f%%", width="small",
                                                          help="quarter-Kelly, % of bankroll"),
             "ref_book": st.column_config.TextColumn("vs", width="small", help="the sharp reference book"),
+            "age": st.column_config.TextColumn("Updated", width="small",
+                                               help="minutes since this book last changed the price; the older, the "
+                                                    "likelier it is gone"),
             "n_books": st.column_config.NumberColumn("Books", width="small"),
             "market_mu": st.column_config.NumberColumn("Market", format="%.1f", width="small"),
             "proj_mean": st.column_config.NumberColumn("Proj", format="%.1f", width="small"),
@@ -284,6 +304,7 @@ def ev_view(ev, cols):
     show["market"] = show.market.map(market)
     show["book"] = show.book.map(book)
     if "ref_book" in show: show["ref_book"] = show.ref_book.map(book)
+    if "age_min" in show: show["age"] = age_col(show.age_min)
     cols = [c for c in cols if c in show]
     st.dataframe(show[cols], width="stretch", hide_index=True, column_config=ev_cfg(show.ev_pct.max()))
 
@@ -314,8 +335,9 @@ def picks_view(p):
     show["ev_pct"] = (show.ev_pct * 100).round(2)
     show["p_win"] = (show.p_win * 100).round(1)
     show["kelly_stake"] = (show.kelly_stake * 100).round(2)
-    cols = ["rank", "commence", "matchup", "market", "pick", "price", "book", "also", "fair_price", "p_win", "ev_pct",
-            "kelly_stake"]
+    show["age"] = age_col(show.age_min) if "age_min" in show else ""
+    cols = ["rank", "commence", "matchup", "market", "pick", "price", "book", "age", "also", "fair_price", "p_win",
+            "ev_pct", "kelly_stake"]
     cfg = ev_cfg(show.ev_pct.max())
     cfg.update({"rank": st.column_config.NumberColumn("#", width="small"),
                 "pick": st.column_config.TextColumn("Pick", width="small"),
@@ -341,7 +363,9 @@ def mid_cfg(max_ev):
             "breakeven %": st.column_config.NumberColumn("Breakeven", format="%.1f%%", width="small"),
             "stake A %": st.column_config.NumberColumn("Stake A", format="%.0f%%", width="small"),
             "stake B %": st.column_config.NumberColumn("Stake B", format="%.0f%%", width="small"),
-            "same numbers also at": st.column_config.TextColumn("Also at", width="medium")}
+            "same numbers also at": st.column_config.TextColumn("Also at", width="medium"),
+            "updated": st.column_config.TextColumn("Updated", width="small",
+                                                   help="age of the older leg's price; old legs are often gone")}
 
 def middles_view(m):
     show = m.copy()
@@ -352,6 +376,7 @@ def middles_view(m):
     show["market"] = show.market.map(market)
     show["type"] = show.type.map(lambda t: TYPE_NAMES.get(t, t))
     for c in ("bet_a", "bet_b", "alt"): show[c] = pretty_bets(show[c])
+    show["age"] = age_col(show.age_min) if "age_min" in show else ""
     cols = [c for c in MID_COLS if c != "player" or show.player.notna().any()]
     return show[cols].rename(columns=MID_NAMES)
 
@@ -409,9 +434,10 @@ def top_cards(ev, mids, min_ev, age, remaining, n_games, n_books):
     with c1:
         if len(ev):
             r = ev.iloc[0]
+            upd = "" if pd.isna(r.get("age_min", np.nan)) else f" · updated {age_text(r.age_min)}"
             card("ev", "Best +EV line", f"+{r.ev_pct * 100:.1f}% EV", ev_bet(r),
                  f"{book(r.book)} · {r.matchup} · fair <span class='mono'>{am(r.fair_price)}</span> at {book(r.ref_book)} · "
-                 f"win {r.p_win:.0%} · stake {r.kelly_stake:.1%}")
+                 f"win {r.p_win:.0%} · stake {r.kelly_stake:.1%}{upd}")
         else:
             card("ev", "Best +EV line", "<span class='dim'>nothing above %.1f%%</span>" % (min_ev * 100),
                  "Efficient board right now", "That's normal between line moves. Lower Min EV % or check back after the sharp books move.")
@@ -429,10 +455,11 @@ def top_cards(ev, mids, min_ev, age, remaining, n_games, n_books):
             card("arb", "Best arb / middle", "<span class='dim'>none on the board</span>", "No cross-book gaps right now",
                  "Middles appear when books disagree on the number — most often in the hours after a sharp move.")
     with c3:
+        cost = pull_budget()["cost"] if not DEMO_ODDS else PULL_COST
         card("info", "Board", f"{n_games} games · {n_books} books",
              f"Odds pulled {age_text(age)}" + (f" · {remaining} credits left this month" if remaining is not None else ""),
-             f"Refreshes every {REFRESH_MIN} min while this tab is open (1 credit each). Non-US books are hidden as bets "
-             "but still set the fair numbers.")
+             f"Refreshes every {REFRESH_MIN} min while this tab is open ({cost} credits each, {MAX_CREDITS}/day cap). "
+             "Excluded books are hidden as bets but still set the fair numbers.")
 
 # -------- main --------
 odds, fetched_at, remaining, paused = load_odds(league, season)
@@ -441,7 +468,7 @@ age = (time.time() - fetched_at) / 60
 pills = []
 if DEMO_ODDS: pills.append('<span class="sm-pill demo">demo file</span>')
 if paused:
-    pills.append(f'<span class="sm-pill warn">paused · {MAX_PULLS} pulls today, odds frozen until midnight</span>')
+    pills.append(f'<span class="sm-pill warn">paused · {MAX_CREDITS} credits today, odds frozen until midnight</span>')
 else:
     pills.append(f'<span class="sm-pill live">● live · odds {age_text(age)}</span>' if has_odds else
                  '<span class="sm-pill warn">no odds key</span>')
@@ -451,7 +478,7 @@ st.markdown(f'<div class="sm-hero"><div><div class="sm-eyebrow">{league.upper()}
             f'<div class="sm-title">{league.upper()} +EV board</div></div><div class="sm-pills">{"".join(pills)}</div></div>',
             unsafe_allow_html=True)
 if odds.empty:
-    st.warning(f"Daily credit budget reached ({MAX_PULLS} pulls); the board will pull again after midnight New York time."
+    st.warning(f"Daily credit budget reached ({MAX_CREDITS} credits); the board will pull again after midnight New York time."
                if paused else NO_KEY)
 else:
     try:
@@ -474,7 +501,7 @@ else:
             keep = {keys_by_name[n] for n in my_books}
             excl = excl + [b for b in present if b not in keep]
     odds, ev, mids = price_board(league, season, week, model_w, min_ev, tuple(markets), tuple(excl), int(hours),
-                                 tuple(teams), fetched_at, model_fair)
+                                 tuple(teams), int(max_age), fetched_at, model_fair)
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Games", odds.event_id.nunique(), help=f"kicking off within {hours} h, of {n_posted} posted")
@@ -513,7 +540,7 @@ if has_odds:
                         "- **Fair** is what the sharp reference book (the *vs* column) says the line is worth. "
                         "Bet the row's book at the row's price — lines move within minutes.")
         if len(ev):
-            ev_view(ev, ["commence", "matchup", "market", "team", "line", "price", "book", "fair_price", "p_win",
+            ev_view(ev, ["commence", "matchup", "market", "team", "line", "price", "book", "age", "fair_price", "p_win",
                          "ev_pct", "kelly_stake", "ref_book"])
             st.caption("One row per stale price. Fair prices come from the sharp reference book (vs), nudged toward the "
                        "model by the blend weight; stakes are quarter-Kelly, capped at 3% of bankroll.")
@@ -626,7 +653,7 @@ with tab5:
                 st.markdown('<div class="sm-section">Top prop picks · best book per prop</div>', unsafe_allow_html=True)
                 picks_view(top_picks(pev, 10))
                 st.markdown('<div class="sm-section">Every +EV prop price</div>', unsafe_allow_html=True)
-                ev_view(pev, ["commence", "matchup", "market", "player", "side", "line", "price", "book", "n_books",
+                ev_view(pev, ["commence", "matchup", "market", "player", "side", "line", "price", "book", "age", "n_books",
                               "market_mu", "proj_mean", "fair_mu", "fair_price", "p_win", "ev_pct", "kelly_stake", "flags"])
             else:
                 st.success("Nothing above your EV threshold in the last scan.")

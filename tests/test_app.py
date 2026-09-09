@@ -41,7 +41,7 @@ def _run(monkeypatch, key):
     st.cache_resource.clear()                               # so is the daily pull budget
     if key: monkeypatch.setenv("ODDS_API_KEY", key)
     else: monkeypatch.delenv("ODDS_API_KEY", raising=False)
-    for v in ("SCAN_PIN", "MAX_PULLS_PER_DAY"): monkeypatch.delenv(v, raising=False)
+    for v in ("SCAN_PIN", "MAX_CREDITS_PER_DAY", "ODDS_BOOKS"): monkeypatch.delenv(v, raising=False)
     at = AppTest.from_file(APP, default_timeout=120)
     at.run()
     assert not at.exception, at.exception
@@ -229,13 +229,15 @@ def test_owner_pin_gates_scans_and_force_refresh(monkeypatch):
     assert not btn.disabled and any(b.label == "Force refresh now" for b in at.button)
 
 
-def test_daily_pull_budget_freezes_the_board(monkeypatch):
-    """A shared link cannot spend more than MAX_PULLS_PER_DAY credits on the board: past the budget the last board is
-    served unchanged with a 'paused' pill, and the API is not called again."""
-    events, calls = _upcoming(), []
+def test_daily_credit_budget_freezes_the_board(monkeypatch):
+    """A shared link cannot spend more than MAX_CREDITS_PER_DAY on the board: past the budget the last board is
+    served unchanged with a 'paused' pill, and the API is not called again. The pull names 10 books (3 credits)."""
+    events, calls, seen = _upcoming(), [], {}
     def fake_get(url, params=None, timeout=None):
         calls.append(url)
-        if url == ODDS_API.format(sport=NFL): return _Resp(_game_event(events), {"x-requests-remaining": "450"})
+        if url == ODDS_API.format(sport=NFL):
+            seen.update(params or {})
+            return _Resp(_game_event(events), {"x-requests-remaining": "450", "x-requests-last": "3"})
         if url == EVENTS_API.format(sport=NFL): return _Resp(events, {"x-requests-remaining": "450"})
         raise AssertionError(f"unexpected call: {url}")
     monkeypatch.setattr(requests, "get", fake_get)
@@ -243,7 +245,9 @@ def test_daily_pull_budget_freezes_the_board(monkeypatch):
     monkeypatch.setattr(sharpmodel, "load_nfl", no_nflverse)
     at = _run(monkeypatch, "k")
     assert calls.count(ODDS_API.format(sport=NFL)) == 1 and at.metric[0].value == "1"
-    monkeypatch.setenv("MAX_PULLS_PER_DAY", "1")
+    assert "regions" not in seen and seen["bookmakers"].count(",") == 9 and "pinnacle" in seen["bookmakers"]
+    assert any("3 credits each" in m.value for m in at.markdown)
+    monkeypatch.setenv("MAX_CREDITS_PER_DAY", "5")                   # 3 spent, the next 3 would breach
     st.cache_data.clear()                                            # the 20-minute cache expired: normally a new pull
     at.run()
     assert not at.exception, at.exception

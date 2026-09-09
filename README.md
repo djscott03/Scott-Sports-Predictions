@@ -59,7 +59,7 @@ your information edge into the adjustment layer.
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt pytest
-python -m pytest -q tests                     # 79 offline tests, ~6s
+python -m pytest -q tests                     # offline tests, ~15s
 
 python run.py nfl backtest 2019 2025          # walk-forward, prints metrics (~5s)
 python run.py nfl predict 2026 1              # price a week's card from live nflverse lines
@@ -92,9 +92,9 @@ with the top picks.
 Filters (sidebar): min EV, kickoff window, markets, **Teams**, **Books** (your accounts —
 everything else is hidden as a bet but still sets the fair numbers), plus the raw exclude box.
 
-Sharing the link: the board is one pull per 20 min for *everyone*, capped by
-`MAX_PULLS_PER_DAY` (then it freezes until midnight); set `SCAN_PIN` so only you can scan
-props or force a refresh — see DEPLOY.md.
+Sharing the link: the board is one pull (3 credits) per 20 min for *everyone*, capped by
+`MAX_CREDITS_PER_DAY` (default 60; then it freezes until midnight); set `SCAN_PIN` so only
+you can scan props or force a refresh — see DEPLOY.md.
 
 Look: Browns orange on dark brown with Cavs wine/gold accents (`.streamlit/config.toml` +
 the CSS block at the top of `app.py`); signal colours stay universal (green best price, red
@@ -138,7 +138,16 @@ screen: one row per pick, one column per book), `bestlines_*.csv` (best price pe
 No laptop needed: the **`ev scan`** Action (GitHub → Actions → ev scan → Run workflow;
 pick league/season/week) runs the same command on GitHub's runner with the repo's
 `ODDS_API_KEY` secret and writes the +EV table and the arbs & middles table into the run's
-job summary, with the CSVs as a downloadable artifact. Manual only — every run is 1 credit.
+job summary, with the CSVs as a downloadable artifact. Manual only — every run is 3 credits
+(3 markets × 10 named books, Pinnacle included; `books` = `wide` pulls 20 books for 6).
+
+**Credits, precisely.** The Odds API bills a game-line pull `markets × regions`, and every
+10 *named* bookmakers count as one region. The original all-regions pull (35 books) cost 9
+credits, which is why the first weekend burned through 34 credits in a few clicks. Everything
+now names 10 books (`odds.CORE_BOOKS`: Pinnacle as the sharp anchor, the big US apps, Bovada
+and BetOnline as soft offshore books) = **3 credits per pull**, and prints what the API
+actually charged (`x-requests-last`). `ODDS_BOOKS=wide` in the app secrets, `--books wide` on
+the CLI, or the `books` input on the Actions widens it to 20 books for 6.
 
 Realistic expectations: on a mature NFL Sunday you'll see 0–5 lines above +1.5% EV,
 mostly stale numbers at recreational books after a sharp move. That is the whole
@@ -215,6 +224,86 @@ credit; the board surfaced a real 3-point middle (BAL −2.5 at one book, LAC +3
 The props scan (2 games × 4 markets = 8 credits, cost per call verified against the
 `x-requests-last` header) found a receiving-yards middle with a 20–22 window.
 
+## Alerts (Discord / Telegram)
+
+You don't have to watch the dashboard. The **`alerts`** Action pulls the board once an hour
+on game days, scans it exactly like the `ev scan` Action (market-only, non-US books excluded,
+games inside 240 h), and pushes only what is **new since the last run** to a Discord channel
+and/or a Telegram chat. A message looks like this:
+
+```
+🏈 SharpModel · NFL · Sun Sep 13 12:02 PM ET
+🔒 ARB +2.44% locked · SEA ML +100 @ FanDuel × LA ML +110 @ DraftKings · split 51/49
+🟢 FREE MIDDLE +7.7% EV · O 44.5 +100 @ FanDuel × U 46.5 +100 @ BetMGM · window 45-46 · hits 8%
+🎯 MIDDLE +3.0% EV · BAL -2.5 -110 @ BetUS × LAC +3.5 -110 @ DraftKings · window 3 · hits 8%, miss costs 4.5%
+💰 +EV 6.2% · PIT -3.5 +105 @ Hard Rock OH (fair -107) · also Bovada +100, BetUS +100 · Sun 1:00PM
+4 new · credits left 471
+```
+
+What gets sent, in this order: every pair that **cannot lose** (arbs, free middles — always),
+**middles** at ≥ 1% EV of the total stake, then the **top 5 +EV picks** at ≥ 2% EV (one row per
+pick at its best book, the other books on the same number after *also*). Prices a book has not
+touched in 45 minutes are skipped (they are usually gone by the time you tap). Nothing new →
+no message. Each alert is remembered for 24 hours (`alerts_state.json`, carried between runs by
+the Action's cache, never committed), so you get one ping per line — a re-price is a new line,
+and a number that survives a whole day gets one reminder.
+
+### Set up Discord (5 minutes, do this yourself — the secret is yours)
+
+1. In Discord, make a private server (or use one you own) and a channel like `#sharpmodel`.
+2. Click the channel's gear (**Edit Channel**) → **Integrations** → **Webhooks** → **New Webhook**
+   (or **Server Settings → Integrations → Webhooks → New Webhook** and pick the channel).
+3. Give it a name, then **Copy Webhook URL**. Treat that URL like a password: anyone who has
+   it can post to your channel.
+4. Put it in the repo's secrets. Either on the website — GitHub → your repo → **Settings** →
+   **Secrets and variables** → **Actions** → **New repository secret**, name `DISCORD_WEBHOOK`,
+   paste the URL — or from the terminal:
+   ```bash
+   cd "~/Desktop/Claude/Sports Bets"
+   gh secret set DISCORD_WEBHOOK        # paste the URL when it prompts, press Enter
+   ```
+5. Test it: GitHub → **Actions** → **alerts** → **Run workflow** → set **test** to `true` →
+   **Run workflow**. Within a minute the channel gets the current top pick (or "no plays above
+   +2% EV right now") — that costs 3 credits and does not touch the alert memory. Turn on
+   notifications for the channel on your phone.
+
+### Telegram instead (or as well)
+
+Message **@BotFather** → `/newbot` → copy the token → `gh secret set TELEGRAM_BOT_TOKEN`.
+Send your new bot any message, then open
+`https://api.telegram.org/bot<token>/getUpdates` in a browser and copy the `"chat":{"id":…}`
+number → `gh secret set TELEGRAM_CHAT_ID`. Whichever secrets exist get the message; with none
+set the Action only prints it into the run's job summary.
+
+### Schedule and credits (why it is not every 5 minutes)
+
+The free Odds API tier is 500 credits a month and every scan is **3 credits** (3 markets × 10
+named books; naming books instead of regions is what keeps Pinnacle on the board for the price
+of one region), so the schedule in `.github/workflows/alerts.yml` is deliberately thin:
+**Sunday hourly 9am–5pm ET plus 8pm for SNF (10), Thursday and Monday at 7pm and 8pm ET (2
+each), and noon ET Tuesday and Friday for the openers (2)** — 16 runs, 48 credits a week,
+about 210 a month, leaving ~290 for the dashboard and manual scans. A scheduled run with no
+webhook secret exits *before* pulling (0 credits), so the schedule can sit on `main` until
+you add the secret. GitHub cron is UTC, so the file's comments carry the conversion; after the November
+clock change every run lands an hour earlier on your wall clock, which still covers the 1pm /
+4pm / SNF windows.
+
+- **Change the thresholds** for one run: **Run workflow** and edit `min_ev` / `hours` (a
+  scheduled run always uses the defaults). To change them permanently, edit the `default:`
+  lines under `inputs:` in `alerts.yml`, or add `--min-middle-ev`, `--max-age`, `--top`,
+  `--exclude` to the `python alerts.py` line.
+- **Pause** it: comment out the `schedule:` block (put `#` in front of those lines) and push;
+  manual runs still work. Delete individual `cron:` lines to spend less — Sunday is the one that
+  matters.
+- **Run it by hand / offline**: `python alerts.py nfl --dry-run` (3 credits, prints, sends
+  nothing) or `python alerts.py nfl --csv odds_nfl_2026_w1.csv --dry-run` (0 credits, a saved
+  board). `python alerts.py nfl --test` pushes the top pick regardless of memory.
+
+Every run appends its message (or "nothing new") to the Action's job summary, and the runner
+never makes more than one pull (3 credits) per run. The secrets — webhook URL, bot token, Odds key — are
+never printed; a failed webhook exits non-zero *without* remembering the alerts, so the next
+run re-sends them.
+
 ## Player props (NFL, free tier)
 
 Same philosophy, smaller market: the devigged multi-book consensus is the prior, a usage
@@ -257,7 +346,7 @@ The dashboard's **Props** tab does the same thing behind a button that shows the
 estimate; the `props scan` Action (manual dispatch) writes the board to the job summary.
 
 **Quota math.** Props live on a per-event endpoint that bills `markets × regions` credits per
-game (the game-line scan above is 1 credit total). Cost = games × markets × regions; the free
+game (the game-line scan above is 3 credits total). Cost = games × markets × regions; the free
 tier is 500/month. Defaults — 4 markets, US region, games in the next 72 h — run ≈ 4 × ~6
 games ≈ 24 credits per scan (a full 16-game window would be 64). `fetch_props` refuses up
 front when the estimate exceeds `--credits`, or when the credits the free events call reports
@@ -318,7 +407,8 @@ tests/            offline pytest suite (pricing math, ratings, walk-forward, adj
   weekly-card.yml Tue/Thu cron: publish_card.py -> commits predictions/
   backtest.yml    manual walk-forward backtest -> job summary
   props-scan.yml  manual-only prop scan -> job summary + CSV artifact (never scheduled: quota)
-  ev-scan.yml     manual-only +EV / arbs & middles scan (1 credit) -> job summary + CSV artifact
+  ev-scan.yml     manual-only +EV / arbs & middles scan (3 credits) -> job summary + CSV artifact
+  alerts.yml      game-day cron (16 runs/week x 3 credits) + manual: alerts.py -> Discord / Telegram
 ```
 
 ### The number pipeline for one game

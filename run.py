@@ -23,7 +23,7 @@ from sharpmodel.middles import find_middles, game_fairs, prop_fairs
 
 pd.set_option("display.width", 200); pd.set_option("display.max_columns", 40)
 
-OPTS = ("--csv", "--markets", "--hours", "--credits", "--weight", "--exclude")   # flags that take a value
+OPTS = ("--csv", "--markets", "--hours", "--credits", "--weight", "--exclude", "--books")   # flags that take a value
 opt = lambda flag, default=None: sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else default
 MID_COLS = ["type", "matchup", "market", "player", "bet_a", "bet_b", "window", "p_middle", "miss_cost_pct",
             "win_both_pct", "ev_pct", "guaranteed_pct", "breakeven_p", "n_alt", "alt"]
@@ -95,7 +95,8 @@ elif mode == "ev":
         hist = load_nfl([season - 1, season], with_epa=epa) if league == "nfl" else hist
         wp = SharpModel(league).predict_week(hist, season, week)
         model_fair = wp.preds[["home", "away", "model_margin", "model_total"]]
-    odds = load_odds_csv(csv) if csv else fetch_odds(league, known_teams=known)
+    # --books core (10 incl. Pinnacle = 3 credits) | wide (20 = 6) | a comma list; every 10 named books bill like 1 region
+    odds = load_odds_csv(csv) if csv else fetch_odds(league, known_teams=known, books=opt("--books", "core"))
     odds.to_csv(f"odds_{league}_{season}_w{week}.csv", index=False)
     n_all = odds.event_id.nunique()
     odds = within_hours(odds, hours)                                             # the API returns the whole season

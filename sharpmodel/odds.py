@@ -42,6 +42,22 @@ NON_US_BOOKS = ["pinnacle", "marathonbet", "matchbook", "smarkets", "betfair_ex_
                 "bluebet", "topsport", "gtbets", "everygame"]
 
 
+STALE_MIN = 45   # a price its book has not touched in this long, while the sharp books moved, is probably already gone
+
+
+def add_age(odds: pd.DataFrame, now=None) -> pd.DataFrame:
+    """age_min: minutes since the book last changed this price (the API's per-market last_update, kept as `updated`).
+    NaN for hand-captured CSVs. The +EV signal *is* a book lagging the sharps, so an old price is both the
+    opportunity and the warning that it may not be there when you click -- see find_ev's lag_min."""
+    o = odds.copy()
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None: now = now.tz_localize("UTC")
+    upd = (pd.to_datetime(o["updated"], utc=True, errors="coerce") if "updated" in o
+           else pd.Series(pd.NaT, index=o.index, dtype="datetime64[ns, UTC]"))   # tz-aware NaT: naive - aware raises
+    o["age_min"] = (now - upd).dt.total_seconds() / 60
+    return o
+
+
 def within_hours(odds: pd.DataFrame, hours: float) -> pd.DataFrame:
     """Lines whose game kicks off within `hours` from now. The API posts the whole season (272 NFL games on the
     first live pull) and far-future numbers are stale by nature; 240 h covers a Tue-Mon slate. Rows without a
@@ -119,15 +135,58 @@ def _remaining(r) -> int | None:
         return None
 
 
+# The game-line endpoint bills MARKETS x REGIONS per call, and "every group of 10 bookmakers is the equivalent of 1
+# region" when `bookmakers` is given instead of `regions` (the-odds-api.com v4 quota docs; measured 2026-09-06: the
+# old us,us2,eu default cost 9 a pull). So a hand-picked 10-book list costs 3 credits AND keeps Pinnacle, the sharp
+# anchor, which regions=us would drop. CORE = the anchor + the big US apps + two soft offshore books; WIDE adds the
+# next ten (6 credits). Pass a comma list or a list of keys for anything else.
+CORE_BOOKS = ["pinnacle", "draftkings", "fanduel", "betmgm", "williamhill_us", "espnbet", "fanatics", "betrivers",
+              "bovada", "betonlineag"]
+WIDE_BOOKS = CORE_BOOKS + ["hardrockbet", "betus", "lowvig", "mybookieag", "betanysports", "superbook", "betparx",
+                           "ballybet", "fliff", "unibet_us"]
+BOOK_SETS = {"core": CORE_BOOKS, "wide": WIDE_BOOKS}
+
+
+def book_list(books) -> list | None:
+    """'core' / 'wide' / 'a,b,c' / a list -> list of Odds API book keys; None or '' -> None (use regions)."""
+    if books is None: return None
+    if isinstance(books, str):
+        s = books.strip()
+        if not s: return None
+        if s in BOOK_SETS: return list(BOOK_SETS[s])
+        return [b.strip() for b in s.split(",") if b.strip()]
+    return list(books)
+
+
+def odds_credits(markets="h2h,spreads,totals", regions="us,us2,eu", books="core") -> int:
+    """What one fetch_odds call bills: markets x (ceil(len(books) / 10) if books else regions)."""
+    n_m = len([m for m in str(markets).split(",") if m.strip()])
+    bl = book_list(books)
+    if bl: return n_m * ((len(bl) + 9) // 10)
+    return n_m * len([r for r in str(regions).split(",") if r.strip()])
+
+
 def fetch_odds(league: str, api_key: str | None = None, regions="us,us2,eu",
-               markets="h2h,spreads,totals", known_teams: list[str] | None = None) -> pd.DataFrame:
-    """Long format: event_id, commence, home, away, book, market, side, line, price."""
-    r = _get(ODDS_API.format(sport=SPORT_KEY[league]),
-             {"apiKey": _key(api_key), "regions": regions, "markets": markets, "oddsFormat": "american"})
-    print(f"[odds] requests remaining this month: {r.headers.get('x-requests-remaining')}")
+               markets="h2h,spreads,totals", known_teams: list[str] | None = None, books="core") -> pd.DataFrame:
+    """Long format: event_id, commence, home, away, book, market, side, line, price. books='core' (default, 3 credits:
+    CORE_BOOKS incl. Pinnacle) / 'wide' (6) / a comma list or list of keys / None -> `regions` (us,us2,eu = 9).
+    df.attrs: remaining (credits left this month), cost (this call's x-requests-last), both ints or None."""
+    params = {"apiKey": _key(api_key), "markets": markets, "oddsFormat": "american"}
+    bl = book_list(books)
+    if bl: params["bookmakers"] = ",".join(bl)
+    else: params["regions"] = regions
+    r = _get(ODDS_API.format(sport=SPORT_KEY[league]), params)
+    print(f"[odds] this pull cost {r.headers.get('x-requests-last')} credits; "
+          f"{r.headers.get('x-requests-remaining')} remaining this month")
     df = parse_odds_json(r.json(), league, known_teams)
     df.attrs["remaining"] = _remaining(r)                       # an int, never a frame (pandas 3 compares attrs)
+    df.attrs["cost"] = _header_int(r, "x-requests-last")
     return df
+
+
+def _header_int(r, name) -> int | None:
+    try: return int(float(r.headers.get(name)))
+    except (TypeError, ValueError): return None
 
 
 def parse_odds_json(events: list, league: str, known_teams=None) -> pd.DataFrame:
@@ -372,11 +431,13 @@ def find_ev(odds: pd.DataFrame, league: str, model_fair: pd.DataFrame | None = N
     """
     sd_s, sd_t = LEAGUE_SD[league]["spread"], LEAGUE_SD[league]["total"]
     mf = model_fair.set_index(["home", "away"]) if model_fair is not None else None
+    if len(odds) and "age_min" not in odds: odds = add_age(odds)
     rows = []
     for eid, e in odds.groupby("event_id"):
         home, away = e.home.iloc[0], e.away.iloc[0]
         f = blended_fair(e, league, mf, model_weight)
         mu_m, mu_t, mu_ml = f["mu_margin"], f["mu_total"], f["mu_ml"]
+        ref_age = e[e.book == f["ref_book"]].age_min.min() if f["ref_book"] is not None else np.nan
         for _, o in e.iterrows():
             if o.market == "spreads" and np.isfinite(mu_m):
                 home_line = o.line if o.side == "home" else -o.line
@@ -396,10 +457,18 @@ def find_ev(odds: pd.DataFrame, league: str, model_fair: pd.DataFrame | None = N
                              line=o.line, price=o.price, book=o.book, ref_book=f["ref_book"],
                              fair_mu={"spreads": mu_m, "totals": mu_t, "ml": mu_ml}[o.market],
                              p_win=p_win, p_push=p_push, fair_price=_fair_american(p_win, p_push),
-                             ev_pct=ek["ev"], kelly_stake=ek["stake_frac"]))
+                             ev_pct=ek["ev"], kelly_stake=ek["stake_frac"],
+                             updated=o.get("updated"), age_min=o.get("age_min", np.nan),
+                             lag_min=o.get("age_min", np.nan) - ref_age))    # > 0: this book is behind the sharp book
     res = pd.DataFrame(rows)
     if res.empty: return res
     return (res[res.ev_pct >= min_ev].sort_values("ev_pct", ascending=False).reset_index(drop=True))
+
+
+def fresh(df: pd.DataFrame, max_age: float = STALE_MIN) -> pd.DataFrame:
+    """Rows whose price was touched within max_age minutes (rows without a timestamp are kept); 0 = keep everything."""
+    if not max_age or df is None or len(df) == 0 or "age_min" not in df: return df
+    return df[df.age_min.isna() | (df.age_min <= max_age)].reset_index(drop=True)
 
 
 def _fair_american(p_win, p_push):
@@ -419,7 +488,8 @@ def best_lines(odds: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- top picks ----------------
 PICK_COLS = ["rank", "commence", "matchup", "market", "player", "side", "team", "line", "price", "book", "also",
-             "n_books", "fair_price", "p_win", "ev_pct", "kelly_stake", "ref_book", "flags"]
+             "n_books", "fair_price", "p_win", "ev_pct", "kelly_stake", "ref_book", "flags", "updated", "age_min",
+             "lag_min"]
 
 
 def _am(p) -> str:
