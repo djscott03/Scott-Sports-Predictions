@@ -143,11 +143,21 @@ tests/                     offline pytest (136 tests, ~20s; incl. AppTest smoke 
 - `price_props` rows carry `event_id`, `dist` and `fair_sd` (NaN for poisson/bernoulli) so
   `middles.prop_fairs` can rebuild the distribution — keep them. Build the fairs from a board
   priced with `min_ev=-1` (every two-way market), never from the +EV-filtered board alone.
-- **Two margin distributions, on purpose.** engine.py / pricing.py / find_ev still price the weekly
-  card and the +EV board off the plain Normal (sd 13.4): switching would re-price the frozen
-  `predictions/` record. `middles.py` prices NFL spreads/ML off `margins.margin_pmf` (empirical
-  key-number weights, sd 13.2) because a middle lives on single integers — 3 holds ~8% of the mass
-  where the Normal says ~3%. Totals, CFB and props stay Normal / Poisson. Don't "unify" them.
+- **Two margin distributions, on purpose.** engine.py / pricing.py price the weekly CARD off the
+  plain Normal (sd 13.4): switching would re-price the frozen `predictions/` record. Everything on
+  the odds side — `odds.sharp_fair` / `find_ev` (since 2026-09-10) and `middles.py` — prices NFL
+  spreads/ML off `margins.margin_pmf` (empirical key-number weights, sd 13.2) via
+  `odds.margin_dist(league)`, the single switch: 3 holds ~8% of the mass where the Normal says ~3%,
+  so a half point off 3 is worth ~17c, not ~6c. Totals, CFB and props stay Normal / Poisson.
+  `mu` under the pmf is a LOCATION parameter (a -7 coin flip inverts to ~8.3): never mix it with an
+  expected margin — `blended_fair` converts the model's number through `_mu_from_spread(-mm, 0.5)`
+  before blending. Don't "unify" the card with the board.
+- **Sharp consensus by lag, not age.** `sharp_fair` averages every sharp book present per market,
+  weight = SHARP_WEIGHTS prior x `_freshness(age, newest)` = max(exp(-(age - newest)/120 min), 0.2):
+  the freshest sharp book on that market always carries its full prior; one that sat still while
+  peers moved decays to a fifth. The API's `last_update` only advances on a price change, so an
+  absolute age cannot tell "stale" from "confident and unchanged". `ref_book` = heaviest contributor,
+  `ref_n` = sharp books used, `lag_min` = a row's age minus the ref book's. Blank prices are skipped.
 - Middles: the market is still the prior (`game_fairs` = `blended_fair`, `prop_fairs` drops
   `no_market` rows). Same-book pairs are excluded by default; scalps (no window, can lose) are
   dropped; anything with `guaranteed_pct >= 0` (arbs, free middles) is always kept and sorted first.

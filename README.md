@@ -127,13 +127,23 @@ every book at once (Pinnacle included), which is not a stale line. The `ev scan`
 therefore defaults to `--weight 0`, i.e. sharp-book market vs. every other book.
 
 How it prices a line:
-1. Take the sharpest posted book (Pinnacle > Circa > BetOnline > Bookmaker; else median of all).
-2. Devig its two-way price (power method) and invert into a fair number:
-   `PHI -7 (-105/-105)` -> P(cover)=.50 -> fair margin 7.0. Moneylines get their own
-   fair from the sharp ML, not from the spread.
-3. Optionally nudge that fair toward your model (default weight 0.25).
+1. Take every sharp book on the board (Pinnacle 3.0, Circa 2.0, BetOnline 1.5, Bookmaker and
+   LowVig 1.0) and weight each by that prior times how far its last price change *lags the
+   freshest sharp book* on that market (e-fold two hours, floor 0.2 — an unchanged Pinnacle is
+   "confident", not stale; one that sits still while BetOnline moves is). No sharp book posting
+   the market → median of all books. The `vs` column names the heaviest contributor.
+2. Devig each two-way price (power method) and invert it on the **empirical NFL margin
+   distribution** (`margins.py`: a Normal re-weighted at the key numbers, fitted on 1999–2025)
+   into a fair number, then average. `PHI -7 (-105/-105)` -> P(cover | no push) = .50 -> a fair
+   whose *median* is 7. Moneylines get their own fair from the sharp ML, not from the spread;
+   totals and college stay on the Normal.
+3. Optionally nudge that fair toward your model (default weight 0.25; the model's margin is
+   converted into the same distribution first, so a model that agrees with the market changes
+   nothing).
 4. Price **every** book's line — including alternate numbers like -6.5 or -7.5 — off
    that same distribution, so a `-6.5 -110` and a `-7 +100` are compared as probabilities.
+   Because 3 and 7 carry their real mass, buying the half point off 3 (`-2.5` vs a `-3` fair)
+   is worth ~17 cents here where the Normal said ~6 — which is roughly what the books charge.
 5. Rank by EV%, size with quarter-Kelly. Arbs and middles are a separate pass (next section).
 
 Outputs: `ev_*.csv` (plays), `middles_*.csv` (arbs & middles), `screen_*.csv` (the odds
