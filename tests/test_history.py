@@ -31,7 +31,7 @@ def test_append_snapshot_twice_on_one_day_is_one_file_with_both_pulls(tmp_path):
     assert list(h.columns) == COLS and len(h) == 10                                   # rows summed, schema fixed
     assert h.pulled_at.nunique() == 2 and h.pulled_at.max() - h.pulled_at.min() == pytest.approx(3720)
     assert h.pulled_at.iloc[0] == pytest.approx(T0.timestamp())
-    assert h.updated.iloc[0] is None and h.updated.iloc[-1] == "2026-09-13T15:30:00Z"   # hand CSV vs API timestamps mix
+    assert pd.isna(h.updated.iloc[0]) and h.updated.iloc[-1] == "2026-09-13T15:30:00Z"   # hand CSV vs API timestamps mix (pandas 3 reads a blank back as NA, 2.x as None)
     assert h.line.dtype == float and np.isnan(h.line.iloc[4]) and h.price.iloc[-1] == -175
     # the day is New York's: 11:30pm ET is still Sunday's file, 12:30am ET starts Monday's
     assert append_snapshot(_board(), "nfl", str(tmp_path), "2026-09-14T03:30:00Z") == p1
