@@ -1,8 +1,11 @@
 # Board + alerts: pull the game-line board once on a fixed schedule, PUBLISH it as the dashboard's snapshot (the
-# `board` branch: one commit, no history, never main -- so Streamlit Cloud does not redeploy and any number of
-# viewers read it for 0 credits), and push anything NEW -- arbs, free middles, +EV middles, the top +EV picks --
-# to Discord and/or Telegram (alerts.py). Dedupe lives in alerts_state.json, carried from run to run by
-# actions/cache. The schedule below IS the monthly credit spend: viewers never trigger a pull.
+# `board` branch, never main -- so Streamlit Cloud does not redeploy and any number of viewers read it for 0
+# credits), KEEP the pull in board/../history/<league>/<YYYY-MM-DD>.parquet on that same branch (line history:
+# one small parquet per day, ~17 pulls x 2.5k rows each, a few hundred KB -- a year of it is fine), report the
+# sharp books' moves since the previous snapshot (📈 STEAM), and push anything NEW -- arbs, free middles, +EV
+# middles, the top +EV picks -- to Discord and/or Telegram (alerts.py). Dedupe lives in alerts_state.json,
+# carried from run to run by actions/cache. The schedule below IS the monthly credit spend: viewers never
+# trigger a pull.
 #
 # Credit math -- the free Odds API tier is 500 credits/month and the owner will not pay. The game-line endpoint
 # bills MARKETS x REGIONS per call, and every group of 10 NAMED bookmakers counts as one region (the-odds-api.com
@@ -57,13 +60,13 @@ on:
     - cron: "0 16 * * 2-6"       # Tuesday-Saturday 16:00 UTC (noon ET): openers, mid-week moves, a fresh board daily
 
 # a manual "Run workflow" that lands on top of a scheduled run queues behind it instead of both restoring the same
-# state and sending the same message twice
+# state and sending the same message twice (and two runs never race for the `board` branch)
 concurrency:
   group: alerts
   cancel-in-progress: false
 
 permissions:
-  contents: write            # the board snapshot is force-pushed to the `board` branch (never main)
+  contents: write            # the board snapshot + line history are pushed to the `board` branch (never main)
 
 jobs:
   alerts:
@@ -82,9 +85,24 @@ jobs:
           path: alerts_state.json
           key: alerts-state-${{ github.run_id }}
           restore-keys: alerts-state-
+      # what the previous run left on the `board` branch: its snapshot (--prev: the steam block is this pull vs
+      # that one) and the line history so far (so today's parquet is appended to, not started over). Neither
+      # exists before the first publish, and nothing here may fail the run: no prev = no steam block.
+      - name: fetch the previous snapshot and the line history from the `board` branch
+        env:
+          LEAGUE: ${{ inputs.league || 'nfl' }}
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/djscott03/Scott-Sports-Predictions/board/board/odds_${LEAGUE}.csv" \
+            -o prev_board.csv || rm -f prev_board.csv
+          # the branch exists but cannot be fetched -> FAIL here, before the pull (0 credits): publishing without the
+          # history would overwrite today's parquet with this run's single pull
+          if git ls-remote --exit-code -q origin board >/dev/null 2>&1; then
+            git fetch -q --depth=1 origin board:board
+            if git cat-file -e board:history 2>/dev/null; then git archive board history | tar -x; fi
+          fi
       # inputs are free text: passed through env vars, quoted, never interpolated into the shell; on a scheduled
       # run the inputs context is empty and the `||` defaults apply. Every run pulls once (3 credits), writes the
-      # board snapshot to board/, and alerts whichever channels have secrets.
+      # board snapshot to board/, appends the pull to history/, and alerts whichever channels have secrets.
       - name: pull the board, publish snapshot, alert (3 markets x 10 books = 3 credits with books=core)
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
@@ -97,24 +115,40 @@ jobs:
           BOOKS: ${{ inputs.books || 'core' }}
           TEST: ${{ inputs.test || 'false' }}
         run: |
+          PREV=""
+          if [ -s prev_board.csv ]; then PREV="--prev prev_board.csv"; fi
           if [ "$TEST" = "true" ]; then
-            python alerts.py "$LEAGUE" --min-ev "$MIN_EV" --hours "$HOURS" --books "$BOOKS" --snapshot board --test
+            python alerts.py "$LEAGUE" --min-ev "$MIN_EV" --hours "$HOURS" --books "$BOOKS" --snapshot board --history history --test
           else
-            python alerts.py "$LEAGUE" --min-ev "$MIN_EV" --hours "$HOURS" --books "$BOOKS" --snapshot board
+            python alerts.py "$LEAGUE" --min-ev "$MIN_EV" --hours "$HOURS" --books "$BOOKS" --snapshot board --history history $PREV
           fi
-      # the dashboard's snapshot: a single orphan commit force-pushed to the `board` branch (no history to grow,
-      # never main, so Streamlit Cloud does not redeploy). The app reads it from raw.githubusercontent.com.
-      - name: publish the board snapshot to the `board` branch
+      # the dashboard's snapshot + the line history, committed to the `board` branch (never main, so Streamlit
+      # Cloud does not redeploy; no force: the branch keeps its history and grows by one small parquet a day;
+      # --depth=1 so the runner never downloads that history). The first ever run creates the branch (orphan).
+      # The app reads board/ from raw.githubusercontent.com.
+      - name: publish the board snapshot and line history to the `board` branch
         if: always() && hashFiles('board/*.csv') != ''
         run: |
           git config user.name "sharpmodel-bot"
           git config user.email "actions@users.noreply.github.com"
-          tmp="$(mktemp -d)" && cp -r board "$tmp/board"
-          git checkout -q --orphan board-snapshot
-          git rm -rfq . >/dev/null 2>&1 || true
-          rm -rf board && cp -r "$tmp/board" board && git add board
-          git commit -qm "board snapshot $(date -u +%FT%TZ)"
-          git push -qf origin HEAD:board
+          tmp="$(mktemp -d)"
+          cp -r board "$tmp/board"
+          if [ -d history ]; then cp -r history "$tmp/history"; fi
+          rm -rf board history
+          if git fetch -q --depth=1 origin board:board 2>/dev/null || git rev-parse -q --verify board >/dev/null; then
+            git checkout -q board
+          else
+            git checkout -q --orphan board
+            git rm -rfq . >/dev/null 2>&1 || true
+          fi
+          mkdir -p board && cp -r "$tmp/board/." board/ && git add -A board     # overlay: a cfb run keeps odds_nfl.csv
+          if [ -d "$tmp/history" ]; then mkdir -p history && cp -r "$tmp/history/." history/ && git add -A history; fi
+          if git diff --cached --quiet; then
+            echo "board unchanged, nothing to publish"
+          else
+            git commit -qm "board snapshot $(date -u +%FT%TZ)"
+          fi
+          git push -q origin HEAD:board
       # save the state even when the scan failed (the restored file is re-saved unchanged); a --test run or a
       # first run that crashed before writing leaves no file, so save an empty one rather than fail the step
       - name: keep the dedupe state

@@ -241,12 +241,14 @@ and/or a Telegram chat. A message looks like this:
 🔒 ARB +2.44% locked · SEA ML +100 @ FanDuel × LA ML +110 @ DraftKings · split 51/49
 🟢 FREE MIDDLE +7.7% EV · O 44.5 +100 @ FanDuel × U 46.5 +100 @ BetMGM · window 45-46 · hits 8%
 🎯 MIDDLE +3.0% EV · BAL -2.5 -110 @ BetUS × LAC +3.5 -110 @ DraftKings · window 3 · hits 8%, miss costs 4.5%
+📈 STEAM · DAL @ PHI · Pinnacle PHI -2.5 -> -3.5 (+1.0) in 62 min
 💰 +EV 6.2% · PIT -3.5 +105 @ Hard Rock OH (fair -107) · also Bovada +100, BetUS +100 · Sun 1:00PM
-4 new · credits left 471
+5 new · credits left 471
 ```
 
 What gets sent, in this order: every pair that **cannot lose** (arbs, free middles — always),
-**middles** at ≥ 1% EV of the total stake, then the **top 5 +EV picks** at ≥ 2% EV (one row per
+**middles** at ≥ 1% EV of the total stake, the sharp books' **line moves** since the previous run
+(steam, see below), then the **top 5 +EV picks** at ≥ 2% EV (one row per
 pick at its best book, the other books on the same number after *also*). Prices a book has not
 touched in 45 minutes are skipped (they are usually gone by the time you tap). Nothing new →
 no message. Each alert is remembered for 24 hours (`alerts_state.json`, carried between runs by
@@ -310,6 +312,27 @@ Every run appends its message (or "nothing new") to the Action's job summary, an
 never makes more than one pull (3 credits) per run. The secrets — webhook URL, bot token, Odds key — are
 never printed; a failed webhook exits non-zero *without* remembering the alerts, so the next
 run re-sends them.
+
+### Line history & steam
+
+Every pull is paid for, so none is thrown away: the Action appends the whole board to
+`history/<league>/<YYYY-MM-DD>.parquet` (one small file per New York day, ~17 pulls of ~2.5k
+rows a week) and keeps it on the `board` branch next to the snapshot — the branch now grows a
+few hundred KB a week instead of being rewritten, which is fine for years. Read it back with
+`sharpmodel.history.load_history("history", "nfl", days=7)`: one long frame with `pulled_at`
+(epoch seconds) per row, ready for opening-vs-closing and CLV work.
+
+The same machinery reads **steam**: each run compares the fresh pull against the previous
+snapshot (`--prev`, fetched from the `board` branch) and reports the sharp books' moves —
+Pinnacle, Circa, BetOnline, Bookmaker, LowVig — as `📈 STEAM` lines between the middles and
+the picks: a spread that moved a full point or more, a total by 1.5+, a moneyline by 3+
+points of implied probability (`+1.0` always means *toward the home side / the over*; the
+spread shown is the home team's). At most 5 per run, informational (nothing is staked on them),
+and a move is remembered by the number it moved *to*, so a line that keeps going is a new alert
+and one that sits is not repeated. The first run after the branch is created has nothing to
+compare against and simply skips the block; a history problem of any kind prints
+`[alerts] history skipped: …` and the alerts go out regardless. By hand:
+`python alerts.py nfl --csv board.csv --prev board/odds_nfl.csv --history history --dry-run`.
 
 ## Player props (NFL, free tier)
 

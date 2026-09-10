@@ -46,7 +46,9 @@ def _pick(**kw):
 
 def _board(prices):
     """One game per price: pinnacle -3 -105/-105 anchors it, fanduel posts the away side at +3.5 for `price` -- one
-    +EV pick per game (+100 = +3.0%, +105 = +5.6%, ... ranked by price), kicking off tomorrow, no timestamps."""
+    +EV pick per game (+100 = +7.9%, +105 = +10.6%, ... ranked by price), kicking off tomorrow, no timestamps.
+    (The half point off 3 is priced on the key-number pmf, where a 3 lands 7.9% of the time; the Normal's 3.0% put
+    +100 at +3.0%.)"""
     rows, kick = [], (pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=24)).isoformat()
     for i, p in enumerate(prices):
         ev = dict(event_id=f"e{i}", commence=kick, home=f"H{i}", away=f"A{i}")
@@ -173,7 +175,7 @@ def test_top_cap_applies_after_the_dedupe(tmp_path, monkeypatch, capsys):
     lock, mid = dict(kind="lock", key="L", text="l"), dict(kind="mid", key="M", text="m")
     assert new_items([lock, mid] + picks, {}, 2) == [lock, mid, picks[0], picks[1]]   # locks / middles never count
     assert new_items([lock] + picks, {"L": NOW.isoformat()}, 0) == []
-    # end to end through main(): run 1 alerts the five strongest, run 2 sees them plus a new +3.0% game
+    # end to end through main(): run 1 alerts the five strongest, run 2 sees them plus a new, weaker (+100) game
     monkeypatch.chdir(tmp_path)
     _feed(monkeypatch, _board([125, 120, 115, 110, 105]), _board([125, 120, 115, 110, 105, 100]))
     args = ["nfl", "--csv", "x.csv", "--dry-run", "--state", "s.json", "--top", "5"]
@@ -268,7 +270,9 @@ def test_partial_delivery_remembers_and_exits_0_all_failed_exits_1(tmp_path, mon
     assert "secret-xyz" not in out and "HOOK-SECRET" not in out
     assert list(json.loads((tmp_path / "s.json").read_text())) == ["pick|A0 @ H0|spreads|A0|3.5|fanduel|+110"]
     md = (tmp_path / "alerts_summary.md").read_text()
-    assert "**1 new · sent to Discord · ⚠️ Telegram returned HTTP 500" in md and "- 💰 +EV 8.1%" in md and "secret-xyz" not in md
+    # +3.5 +110 against a -3 -105/-105 fair: 13.3% on the key-number pmf (a 3 lands 7.9% of the time); the Normal's 8.1%
+    # priced the half point at 3.0%
+    assert "**1 new · sent to Discord · ⚠️ Telegram returned HTTP 500" in md and "- 💰 +EV 13.3%" in md and "secret-xyz" not in md
     assert alerts.main(args) == 0 and "nothing new (1 already alerted" in capsys.readouterr().out
     # every channel down: exit 1, the state file never appears, the error (scrubbed) in the summary
     monkeypatch.setattr(requests, "post", lambda url, json=None, timeout=None: _Resp(500, f"nope {url}"))
@@ -293,7 +297,9 @@ def test_stale_rows_dropped_at_max_age_kept_at_zero():
     picks, mids = scan(odds, "nfl", min_ev=1.0, min_middle_ev=0.0, max_age=45, exclude=NON_US_BOOKS)
     assert picks.empty and mids.empty
     picks, mids = scan(odds, "nfl", min_ev=1.0, min_middle_ev=0.0, max_age=0, exclude=NON_US_BOOKS)
-    assert list(picks.book) == ["fanduel"] and picks.iloc[0].age_min == pytest.approx(90, abs=1)
+    # betus -2.5 -110 off a -3 fair is +3.0% on the key-number pmf (the half point off 3 is worth ~17 cents, not the
+    # Normal's 6, which made it -1.7%): a second, weaker pick behind fanduel's +3.5 +100
+    assert list(picks.book) == ["fanduel", "betus"] and picks.iloc[0].age_min == pytest.approx(90, abs=1)
     assert len(mids) == 1 and mids.iloc[0].age_min == pytest.approx(90, abs=1) and mids.iloc[0].window == "3"
     picks, mids = scan(odds, "nfl", min_ev=1.0, max_age=0, exclude=[])                # pinnacle allowed as a leg / bet
     assert "pinnacle" in set(mids.book_a) | set(mids.book_b) or len(mids) >= 1
@@ -418,12 +424,28 @@ def test_alerts_workflow_parses_and_schedule_is_17_runs_a_week():
     assert set(scan_step["env"]) >= {"ODDS_API_KEY", "DISCORD_WEBHOOK", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "BOOKS"}
     assert "--test" in scan_step["run"] and "inputs.test" in raw and '--books "$BOOKS"' in scan_step["run"]
     assert "--snapshot board" in scan_step["run"] and "GITHUB_EVENT_NAME" not in scan_step["run"]   # every run publishes
-    # the snapshot goes to the `board` branch only: an orphan commit force-pushed there, never to main
+    # every pull is kept: the run appends to history/ and compares against the previous snapshot fetched from the
+    # board branch (a 404 before the first publish must not fail the step)
+    assert "--history history" in scan_step["run"] and "--prev prev_board.csv" in scan_step["run"]
+    prev = next(s for s in steps if "prev_board.csv" in s.get("run", "") and "alerts.py" not in s.get("run", ""))
+    assert "raw.githubusercontent.com/djscott03/Scott-Sports-Predictions/board/board/odds_" in prev["run"]
+    assert "curl -fsSL" in prev["run"] and "|| rm -f prev_board.csv" in prev["run"]
+    # a branch that exists but cannot be fetched fails the run BEFORE the pull: publishing without the history would
+    # overwrite today's parquet with this run's single pull
+    assert "git ls-remote --exit-code -q origin board" in prev["run"] and "git fetch -q --depth=1 origin board:board" in prev["run"]
+    assert "|| true" not in prev["run"] and "board:history" in prev["run"] and "git archive board history" in prev["run"]
+    assert steps.index(prev) < steps.index(scan_step)
+    # the snapshot + history go to the `board` branch only, on top of what is there: fetched, no force, never main
     pub = next(s for s in steps if s.get("name", "").startswith("publish the board snapshot"))
-    assert "git push -qf origin HEAD:board" in pub["run"] and "--orphan" in pub["run"] and "always()" in pub["if"]
+    assert "git fetch -q --depth=1 origin board:board" in pub["run"] and "git checkout -q board" in pub["run"] and "always()" in pub["if"]
+    assert "--orphan board" in pub["run"]                                              # the very first run creates it
+    assert "git push -q origin HEAD:board" in pub["run"] and "push -qf" not in raw and "push -f" not in raw and "--force" not in raw
+    assert "cp -r \"$tmp/history/.\" history/" in pub["run"] and "git add -A history" in pub["run"]
+    assert "git diff --cached --quiet" in pub["run"]                                   # commit only when something changed
     assert "origin main" not in raw and "HEAD:main" not in raw
     assert "GITHUB_STEP_SUMMARY" in raw
     assert "3 credits" in raw and "17 runs/week" in raw and "markets x regions" in raw.lower()   # the credit math stays documented
+    assert "= 17 runs/week x 3 credits = 51/week, ~220 credits/month" in raw and "one small parquet" in raw
     assert "1 credit" not in raw.replace("1 credit per market", "")                   # the old "one credit per run" claim is gone
 
 
@@ -440,3 +462,109 @@ def test_snapshot_writes_the_board_and_meta(tmp_path, monkeypatch, capsys):
     meta = json.loads((tmp_path / "board" / "meta_nfl.json").read_text())
     assert meta["league"] == "nfl" and meta["n_events"] == 2 and meta["n_books"] == 2 and meta["rows"] == len(board)
     assert abs(meta["fetched_at"] - pd.Timestamp.now(tz="UTC").timestamp()) < 120 and meta["cost"] is None
+    assert (got.pulled_at == meta["fetched_at"]).all()                                # the next run's --prev reads it
+
+
+# ---------------- line history + steam ----------------
+def _moved(board, sp):
+    """The same board with pinnacle's spread at `sp` (both sides) and the FanDuel pick still on the board."""
+    b = board.copy()
+    b.loc[(b.book == "pinnacle") & (b.side == "home"), "line"] = sp
+    b.loc[(b.book == "pinnacle") & (b.side == "away"), "line"] = -sp
+    return b
+
+
+def test_history_and_steam_through_main(tmp_path, monkeypatch, capsys):
+    """--history appends the pull to a day parquet; --prev (a path or URL) adds a 📈 STEAM block for the sharp books'
+    moves, between the middles and the picks, deduped on the number moved to; no prev = skipped, never a failure."""
+    from sharpmodel.history import day_file
+    monkeypatch.chdir(tmp_path)
+    now = pd.Timestamp.now(tz="UTC")
+    prev = _board([110]).assign(pulled_at=(now - pd.Timedelta(minutes=62)).timestamp())
+    prev.to_csv("prev.csv", index=False)
+    curr = _moved(_board([110]), -2.0)                                                 # pinnacle H0 -3 -> -2: steam toward A0
+    _feed(monkeypatch, curr, curr, curr, curr)
+    args = ["nfl", "--csv", "x.csv", "--dry-run", "--state", "s.json", "--history", "hist"]
+    assert alerts.main(args + ["--prev", "prev.csv"]) == 0
+    out = capsys.readouterr().out
+    path = day_file("hist", "nfl", now)
+    assert f"[alerts] history -> {path}" in out and os.path.exists(path)
+    h = pd.read_parquet(path)
+    assert len(h) == len(curr) and h.pulled_at.nunique() == 1 and abs(h.pulled_at.iloc[0] - now.timestamp()) < 120
+    steam = "📈 STEAM · A0 @ H0 · Pinnacle H0 -3 -> -2 (-1.0) in 62 min"            # negative = toward the away side
+    assert steam in out and "1 sharp moves since the last snapshot" in out and "2 new" in out
+    lines = out.split("\n")
+    assert lines.index(steam) < next(i for i, l in enumerate(lines) if l.startswith("💰"))   # steam before the picks
+    state = json.loads((tmp_path / "s.json").read_text())
+    assert "steam|A0 @ H0|spreads|pinnacle|-2" in state and len(state) == 2
+    assert "- " + steam in (tmp_path / "alerts_summary.md").read_text()
+    # run 2, same prev and board: the move is remembered (nothing new); the day file now holds two pulls
+    assert alerts.main(args + ["--prev", "prev.csv"]) == 0
+    assert "nothing new (2 already alerted" in capsys.readouterr().out and pd.read_parquet(path).pulled_at.nunique() == 2
+    # a further move is a new key; the steam cap is its own (--top-steam 0 = no block, picks untouched)
+    prev.to_csv("prev.csv", index=False)
+    _feed(monkeypatch, _moved(_board([110]), -1.0), _moved(_board([110]), 0.0))
+    assert alerts.main(args + ["--prev", "prev.csv", "--state", "s2.json"]) == 0
+    assert "Pinnacle H0 -3 -> -1 (-2.0) in 62 min" in capsys.readouterr().out
+    assert alerts.main(args + ["--prev", "prev.csv", "--state", "s3.json", "--top-steam", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "📈" not in out and "💰" in out and "1 new" in out and "held" not in out
+    # no previous snapshot yet (first run): skipped cleanly, the alerts still go out and the history is still written
+    _feed(monkeypatch, curr)
+    assert alerts.main(args + ["--prev", "nope.csv", "--state", "s4.json"]) == 0
+    out = capsys.readouterr().out
+    assert "[alerts] history skipped: no previous snapshot at nope.csv" in out and "📈" not in out and "💰" in out
+    assert pd.read_parquet(path).pulled_at.nunique() == 5
+    # a URL prev: 404 = first run, 200 = the CSV; requests.get is faked, 20 s timeout, nothing else on the network
+    import requests
+    url = "https://raw.githubusercontent.com/djscott03/Scott-Sports-Predictions/board/board/odds_nfl.csv"
+    calls = []
+    monkeypatch.setattr(requests, "get", lambda u, timeout=None: (calls.append((u, timeout)) or _Resp(404, "Not Found")))
+    _feed(monkeypatch, curr)
+    assert alerts.main(args + ["--prev", url, "--state", "s5.json"]) == 0
+    assert "history skipped: no previous snapshot" in capsys.readouterr().out and calls == [(url, 20)]
+    monkeypatch.setattr(requests, "get", lambda u, timeout=None: _Resp(200, (tmp_path / "prev.csv").read_text()))
+    _feed(monkeypatch, curr)
+    assert alerts.main(args + ["--prev", url, "--state", "s6.json"]) == 0
+    assert steam in capsys.readouterr().out
+    monkeypatch.setattr(requests, "get", lambda u, timeout=None: _Resp(500, "boom " + url))
+    _feed(monkeypatch, curr)
+    assert alerts.main(args + ["--prev", url, "--state", "s7.json"]) == 0
+    out = capsys.readouterr().out
+    assert "[alerts] history skipped: RuntimeError: prev fetch returned HTTP 500" in out and "💰" in out
+    # a history failure (an unwritable DIR) is reported and never costs the alerts; --test does no steam
+    _feed(monkeypatch, curr, curr)
+    assert alerts.main(["nfl", "--csv", "x.csv", "--dry-run", "--state", "s8.json", "--history", "prev.csv"]) == 0
+    out = capsys.readouterr().out
+    assert "[alerts] history skipped:" in out and "💰" in out
+    assert alerts.main(["nfl", "--csv", "x.csv", "--dry-run", "--test", "--prev", "prev.csv"]) == 0
+    assert "📈" not in capsys.readouterr().out
+
+
+def test_steam_items_order_cap_and_keys():
+    from sharpmodel.history import moves
+    ev = dict(event_id="e", commence="2026-09-13T17:00:00Z", home="PHI", away="DAL")
+    prev = pd.DataFrame([dict(ev, book="pinnacle", market="spreads", side="home", line=-2.5, price=-105),
+                         dict(ev, book="pinnacle", market="ml", side="home", line=np.nan, price=-150)])
+    curr = pd.DataFrame([dict(ev, book="pinnacle", market="spreads", side="home", line=-3.5, price=-105),
+                         dict(ev, book="pinnacle", market="ml", side="home", line=np.nan, price=-175)])
+    mv = moves(prev, curr)
+    items = build_items(pd.DataFrame([_pick()]), _mids(), steam=mv)
+    assert [i["kind"] for i in items] == ["lock", "lock", "mid", "mid", "steam", "steam", "pick"]
+    assert {i["key"] for i in items if i["kind"] == "steam"} == {"steam|DAL @ PHI|spreads|pinnacle|-3.5",
+                                                                  "steam|DAL @ PHI|ml|pinnacle|-175"}
+    assert [i["text"] for i in items if i["kind"] == "steam"] == ["📈 STEAM · DAL @ PHI · Pinnacle PHI ML -150 -> -175 (+3.6%)",
+                                                                   "📈 STEAM · DAL @ PHI · Pinnacle PHI -2.5 -> -3.5 (+1.0)"]
+    assert build_items(None, None, steam=mv.iloc[0:0]) == [] and build_items(None, None, steam=None) == []
+    steam = [i for i in items if i["kind"] == "steam"]
+    assert new_items(items, {}, 5, 1) == items[:4] + steam[:1] + items[-1:]           # the steam cap is its own
+    assert new_items(items, {steam[0]["key"]: NOW.isoformat()}, 5, 1) == items[:4] + steam[1:] + items[-1:]
+    assert new_items(items, {}, 0, 0) == items[:4]
+
+
+def test_load_prev_gives_a_hand_csv_an_event_id(tmp_path):
+    """A hand-captured previous board (lines_template.csv schema, no event_id) must still match the current board's
+    games in history.moves -- load_odds_csv synthesises home@away for the current one, load_prev does the same."""
+    prev = alerts.load_prev(os.path.join(ROOT, "lines_template.csv"))
+    assert "event_id" in prev.columns and (prev.event_id == prev.home + "@" + prev.away).all()
+    assert alerts.load_prev(str(tmp_path / "missing.csv")) is None

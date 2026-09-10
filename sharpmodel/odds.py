@@ -3,11 +3,14 @@ Multi-book odds -> fair prices -> +EV lines.
 
 Pipeline
   1. Pull every book's spread / total / moneyline (The Odds API, or CSV).
-  2. Pick a sharp reference (Pinnacle > Circa > BetOnline > Bookmaker > consensus).
-  3. Devig the sharp two-way price and invert it into a fair margin/total (mu).
-     e.g. Pinnacle PHI -6.5 (-108 / -102) -> P(PHI covers)=0.513 -> mu_PHI = 6.5 + 13.4*z(0.513)
+  2. Devig every sharp book's two-way price (SHARP_BOOKS) and invert each into a fair margin/total (mu).
+     e.g. Pinnacle PHI -6.5 (-108 / -102) -> P(PHI covers)=0.513 -> the mu whose P(margin > 6.5) is 0.513.
+     NFL spreads and moneylines invert through the empirical key-number pmf (margins.py: a -3 pushes ~9% of
+     the time, not the Normal's 3%); totals and CFB through the Normal. margin_dist() holds that choice.
+  3. Average the sharp mus, weighted by SHARP_WEIGHTS x freshness (exp(-age_min / 60)): a stale Pinnacle
+     number yields to a live BetOnline one. Median over every book when no sharp book posts the market.
   4. Optionally blend mu with your model number.
-  5. Price EVERY book's line (including off-market alternate numbers) off that mu.
+  5. Price EVERY book's line (including off-market alternate numbers) off that mu, on the same distribution.
   6. Rank by EV, size with fractional Kelly, flag arbs.
 
 Why invert to mu instead of comparing prices directly: books post different
@@ -24,13 +27,20 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from .pricing import (LEAGUE_SD, devig, american_to_prob, decimal_from_american,
-                      cover_probs, total_probs, edge_and_kelly)
+                      cover_probs, total_probs, moneyline_prob, edge_and_kelly)
+from .margins import (NFL_SD, NFL_KEY_WEIGHTS, cover_probs_emp, moneyline_prob_emp,
+                      implied_margin_emp, implied_margin_ml_emp)
 
 ODDS_API = "https://api.the-odds-api.com/v4/sports/{sport}/odds"
 EVENTS_API = "https://api.the-odds-api.com/v4/sports/{sport}/events"                 # free (0 credits)
 PROPS_API = "https://api.the-odds-api.com/v4/sports/{sport}/events/{event_id}/odds"  # markets x regions credits
 SPORT_KEY = {"nfl": "americanfootball_nfl", "cfb": "americanfootball_ncaaf"}
 SHARP_BOOKS = ["pinnacle", "circasports", "betonlineag", "bookmaker", "lowvig"]
+# Prior weight of each sharp book in the consensus fair; multiplied by freshness = exp(-age_min / FRESH_TAU_MIN),
+# so a Pinnacle number an hour old counts 3.0 x 0.37 = 1.1 against a live BetOnline's 1.5. Unknown age (CSV) = 1.0.
+SHARP_WEIGHTS = {"pinnacle": 3.0, "circasports": 2.0, "betonlineag": 1.5, "bookmaker": 1.0, "lowvig": 1.0}
+FRESH_TAU_MIN = 120.0     # e-fold of a sharp book's weight per two hours BEHIND the freshest sharp book on that market
+FRESH_FLOOR = 0.2         # a confident, unchanged Pinnacle never drops below a fifth of its prior weight
 # Books a US bettor cannot get down at (EU/UK/AU region keys, exchanges, Pinnacle). They still anchor the fair
 # number; `--exclude nonus` keeps them out of the +EV rows and the arb/middle legs.
 NON_US_BOOKS = ["pinnacle", "marathonbet", "matchbook", "smarkets", "betfair_ex_eu", "betfair_ex_uk", "betfair_ex_au",
@@ -352,51 +362,137 @@ def load_props_csv(path: str) -> pd.DataFrame:
 
 
 # ---------------- fair pricing ----------------
+def margin_dist(league: str) -> dict:
+    """The margin distribution behind every spread and moneyline price, {kind, sd, weights}: 'nfl_margin' for the
+    NFL (margins.margin_pmf at NFL_SD with the key-number weights: a -3 pushes ~9% of the time, not the Normal's
+    3%), 'normal' at LEAGUE_SD for CFB. sharp_fair inverts prices with it and find_ev prices with it, so the two
+    can never disagree; middles.game_fairs names the same dist. Totals are Normal at LEAGUE_SD everywhere."""
+    if league == "nfl":
+        return {"kind": "nfl_margin", "sd": NFL_SD, "weights": NFL_KEY_WEIGHTS}
+    return {"kind": "normal", "sd": LEAGUE_SD[league]["spread"], "weights": None}
+
+
+def _cover(dist: dict, mu: float, home_line: float) -> dict:
+    """{win, push, loss} for the HOME side of `home_line` at fair mu on `dist`."""
+    if dist["kind"] == "nfl_margin": return cover_probs_emp(mu, home_line, dist["sd"], dist["weights"])
+    return cover_probs(mu, home_line, dist["sd"])
+
+
+def _ml_prob(dist: dict, mu: float) -> float:
+    """P(home wins outright) at fair mu on `dist`."""
+    if dist["kind"] == "nfl_margin": return moneyline_prob_emp(mu, dist["sd"], dist["weights"])
+    return moneyline_prob(mu, dist["sd"])
+
+
+def _mu_from_spread(dist: dict, home_line: float, q_home: float) -> float:
+    """Devigged P(home covers `home_line`) -> the fair mu on `dist` (home covers if margin > -line)."""
+    if dist["kind"] == "nfl_margin": return implied_margin_emp(home_line, q_home, dist["sd"], dist["weights"])
+    return -home_line + dist["sd"] * norm.ppf(q_home)
+
+
+def _mu_from_ml(dist: dict, q_home: float) -> float:
+    """Devigged P(home wins) -> the fair mu on `dist`."""
+    if dist["kind"] == "nfl_margin": return implied_margin_ml_emp(q_home, dist["sd"], dist["weights"])
+    return dist["sd"] * norm.ppf(q_home)
+
+
+def _freshness(age_min, newest=0.0) -> float:
+    """Weight multiplier for a sharp book's price by how far BEHIND the freshest sharp book on the same market it
+    is (rel = age - newest): max(exp(-rel / FRESH_TAU_MIN), FRESH_FLOOR). The API's last_update advances when a
+    book changes its price, so an absolute age cannot tell 'stale' from 'confident and unchanged' -- only lagging
+    the peers can; the freshest book always carries its full prior weight. 1.0 when the age is unknown (a CSV)."""
+    if age_min is None or pd.isna(age_min): return 1.0
+    base = 0.0 if newest is None or pd.isna(newest) else float(newest)
+    rel = max(float(age_min) - base, 0.0)
+    return float(max(np.exp(-rel / FRESH_TAU_MIN), FRESH_FLOOR))
+
+
 def _two_way(df: pd.DataFrame, a: str, b: str, market: str):
-    """Matched (line, price_a, price_b) for a two-way market at one book, or None."""
+    """Matched (line, price_a, price_b, age_min) for a two-way market at one book, or None. age_min is the older
+    side's (the API stamps both sides of a market together), NaN when neither row carries one."""
     da, db = df[df.side == a], df[df.side == b]
     for _, ra in da.iterrows():
         if market == "ml": m = db
         elif market == "spreads": m = db[np.isclose(db.line.astype(float), -float(ra.line))]
         else: m = db[np.isclose(db.line.astype(float), float(ra.line))]
-        if len(m): return ra.line, ra.price, m.iloc[0].price
+        if len(m):
+            rb = m.iloc[0]
+            ages = [x for x in (ra.get("age_min", np.nan), rb.get("age_min", np.nan)) if x is not None and pd.notna(x)]
+            return ra.line, ra.price, rb.price, (max(ages) if ages else np.nan)
     return None
 
 
-def sharp_fair(event_odds: pd.DataFrame, league: str) -> dict:
-    """Invert the sharpest available book into fair mu_margin / mu_total.
-    Falls back to the median over all books if no sharp book is posted."""
-    sd_s, sd_t = LEAGUE_SD[league]["spread"], LEAGUE_SD[league]["total"]
-    out = {"ref_book": None, "mu_margin": np.nan, "mu_total": np.nan, "mu_ml": np.nan}
+def _implied(book_odds: pd.DataFrame, dist: dict, sd_t: float) -> dict:
+    """One book's devigged prices -> {market: (mu, age_min)} for whichever of spreads / ml / totals it posts two-way."""
+    out = {}
+    ok = lambda *xs: all(x is not None and np.isfinite(float(x)) for x in xs)   # a blank price cannot anchor anything
+    sp = _two_way(book_odds[book_odds.market == "spreads"], "home", "away", "spreads")
+    if sp and ok(sp[0], sp[1], sp[2]):
+        line, ph, pa, age = sp
+        out["spreads"] = (_mu_from_spread(dist, float(line), devig(ph, pa)[0]), age)
+    ml = _two_way(book_odds[book_odds.market == "ml"], "home", "away", "ml")
+    if ml and ok(ml[1], ml[2]):
+        _, ph, pa, age = ml
+        out["ml"] = (_mu_from_ml(dist, devig(ph, pa)[0]), age)
+    tt = _two_way(book_odds[book_odds.market == "totals"], "over", "under", "totals")
+    if tt and ok(tt[0], tt[1], tt[2]):
+        line, po, pu, age = tt
+        out["totals"] = (float(line) + sd_t * norm.ppf(devig(po, pu)[0]), age)
+    return {m: v for m, v in out.items() if np.isfinite(v[0])}
 
-    books = [b for b in SHARP_BOOKS if b in set(event_odds.book)] or sorted(set(event_odds.book))
-    mus_m, mus_t, mus_ml, ref = [], [], [], None
-    for bk in books:
-        e = event_odds[event_odds.book == bk]
-        sp = _two_way(e[e.market == "spreads"], "home", "away", "spreads")
-        if sp:
-            line, ph, pa = sp
-            qh, _ = devig(ph, pa)
-            mus_m.append(-line + sd_s * norm.ppf(qh))      # home covers if margin > -line
-        ml = _two_way(e[e.market == "ml"], "home", "away", "ml")
-        if ml:
-            _, ph, pa = ml
-            qh, _ = devig(ph, pa)
-            mus_ml.append(sd_s * norm.ppf(qh))           # moneyline-implied margin, kept separate
-            if not sp: mus_m.append(mus_ml[-1])
-        tt = _two_way(e[e.market == "totals"], "over", "under", "totals")
-        if tt:
-            line, po, pu = tt
-            qo, _ = devig(po, pu)
-            mus_t.append(line + sd_t * norm.ppf(qo))
-        if (sp or ml or tt) and ref is None:
-            ref = bk
-        if bk in SHARP_BOOKS and (sp or ml):
-            break                                           # sharpest book found; stop
-    out["ref_book"] = ref
-    if mus_m: out["mu_margin"] = float(np.median(mus_m))
-    if mus_t: out["mu_total"] = float(np.median(mus_t))
-    out["mu_ml"] = float(np.median(mus_ml)) if mus_ml else out["mu_margin"]
+
+MARKETS = ("spreads", "ml", "totals")
+
+
+def sharp_fair(event_odds: pd.DataFrame, league: str) -> dict:
+    """
+    Fair mu_margin / mu_ml / mu_total for one event from the sharp books, each market on its own.
+    Every SHARP_BOOKS book posting a market is devigged and inverted on margin_dist(league) (spreads, moneylines) or
+    the Normal (totals), then averaged with weight SHARP_WEIGHTS[book] x _freshness(age, newest) -- a book's weight
+    decays by how far its last price change lags the freshest sharp book on that market (e-fold FRESH_TAU_MIN,
+    floor FRESH_FLOOR; 1.0 when ages are unknown); age_min is add_age'd here if the frame lacks it. A Pinnacle
+    spread untouched for six hours next to a BetOnline one changed two minutes ago lands mostly on BetOnline
+    (3 x 0.2 vs 1.5 x 1); two equally fresh land 2:1 toward Pinnacle; a Pinnacle that is the freshest keeps full weight
+    however old, because 'unchanged' is not 'stale'.
+    A book that posts only a spread contributes only to mu_margin. A market no sharp book posts falls back to the
+    median over every book; a margin with no spread anywhere comes from the moneylines and vice versa.
+    ref_book: the heaviest contributor to the spread (to the ML, then the total, when nobody posts a spread);
+    ref_n: distinct sharp books used (0 on the all-book fallback); ref_age: ref_book's age_min on that market.
+    """
+    dist, sd_t = margin_dist(league), LEAGUE_SD[league]["total"]
+    out = {"ref_book": None, "mu_margin": np.nan, "mu_total": np.nan, "mu_ml": np.nan, "ref_n": 0, "ref_age": np.nan}
+    if event_odds is None or len(event_odds) == 0: return out
+    e = event_odds if "age_min" in event_odds else add_age(event_odds)
+    present = set(e.book)
+    contrib = {m: [] for m in MARKETS}                         # market -> [(mu, prior weight, book, age_min)]
+    for bk in [b for b in SHARP_BOOKS if b in present]:
+        for m, (mu, age) in _implied(e[e.book == bk], dist, sd_t).items():
+            contrib[m].append((mu, SHARP_WEIGHTS.get(bk, 1.0), bk, age))
+    out["ref_n"] = len({c[2] for m in MARKETS for c in contrib[m]})
+    everyone = None                                             # every book's implied mus, built only for a fallback
+    mu, ref = {}, {}
+    for m in MARKETS:
+        c = contrib[m]
+        if not c:                                               # no sharp book posts it: median over all books, as before
+            if everyone is None:
+                everyone = {bk: _implied(e[e.book == bk], dist, sd_t) for bk in sorted(present)}
+            c = [(v[m][0], 1.0, bk, v[m][1]) for bk, v in everyone.items() if m in v]
+            if not c: continue
+            mu[m] = float(np.median([x[0] for x in c]))
+            ref[m] = c[0]                                       # first book key posting it, as the old fallback did
+        else:
+            ages = [x[3] for x in c if x[3] is not None and pd.notna(x[3])]
+            newest = min(ages) if ages else 0.0                    # the freshest sharp book on THIS market
+            w = np.array([x[1] * _freshness(x[3], newest) for x in c]); mus = np.array([x[0] for x in c])
+            mu[m] = float((w * mus).sum() / w.sum())
+            ref[m] = c[int(np.argmax(w))]
+    out["mu_margin"] = mu.get("spreads", mu.get("ml", np.nan))
+    out["mu_ml"] = mu.get("ml", out["mu_margin"])
+    out["mu_total"] = mu.get("totals", np.nan)
+    for m in MARKETS:
+        if m in ref:
+            out["ref_book"], out["ref_age"] = ref[m][2], ref[m][3]
+            break
     return out
 
 
@@ -405,7 +501,7 @@ def blended_fair(event_odds: pd.DataFrame, league: str, model_fair: pd.DataFrame
     """sharp_fair for one event, nudged toward the model: mu = (1-w)*sharp + w*model for the margin and
     the total, the ML mu shifted by the same margin nudge. model_fair: df with home, away, model_margin,
     model_total (or that df already indexed by [home, away]); None or a missing game -> pure sharp fair.
-    find_ev and middles.game_fairs both price off exactly this dict."""
+    ref_book / ref_n / ref_age pass through. find_ev and middles.game_fairs both price off exactly this dict."""
     f = sharp_fair(event_odds, league)
     if model_fair is None: return f
     mf = model_fair if isinstance(model_fair.index, pd.MultiIndex) else model_fair.set_index(["home", "away"])
@@ -414,7 +510,12 @@ def blended_fair(event_odds: pd.DataFrame, league: str, model_fair: pd.DataFrame
     mm, mt = mf.loc[(home, away), ["model_margin", "model_total"]]
     out = dict(f)
     if np.isfinite(f["mu_margin"]) and np.isfinite(mm):
-        out["mu_margin"] = (1 - model_weight) * f["mu_margin"] + model_weight * mm
+        # mu is the distribution's LOCATION parameter, which under the key-number pmf sits above the number for a
+        # favourite (a -7 coin flip inverts to ~8.3). The model's number is an expected margin, so convert it into the
+        # same space first -- "the model thinks -mm is a coin flip" -- or a model that agrees with the market would
+        # still tilt every favourite's fair toward the dog.
+        mm_loc = _mu_from_spread(margin_dist(league), -float(mm), 0.5)
+        out["mu_margin"] = (1 - model_weight) * f["mu_margin"] + model_weight * mm_loc
         out["mu_ml"] = f["mu_ml"] + (out["mu_margin"] - f["mu_margin"])     # shift ML mu by the same model nudge
     if np.isfinite(f["mu_total"]) and np.isfinite(mt):
         out["mu_total"] = (1 - model_weight) * f["mu_total"] + model_weight * mt
@@ -428,33 +529,36 @@ def find_ev(odds: pd.DataFrame, league: str, model_fair: pd.DataFrame | None = N
     Price every posted line against the fair mu and return +EV plays.
     model_fair: optional df with home, away, model_margin, model_total from SharpModel;
                 blended into the sharp mu with weight `model_weight` (blended_fair).
+    Spreads and moneylines are priced on margin_dist(league) -- the same pmf sharp_fair inverted, so a sharp book's
+    own number is never +EV against itself; an integer line carries the pmf's push mass. Totals are Normal. A
+    moneyline tie (~0.3% at a pick'em) is folded into the away side as before. Rows carry ref_book / ref_n and
+    lag_min = age_min - the reference book's age on its anchoring market (> 0: this book is behind the sharps).
     """
-    sd_s, sd_t = LEAGUE_SD[league]["spread"], LEAGUE_SD[league]["total"]
+    dist, sd_t = margin_dist(league), LEAGUE_SD[league]["total"]
     mf = model_fair.set_index(["home", "away"]) if model_fair is not None else None
     if len(odds) and "age_min" not in odds: odds = add_age(odds)
     rows = []
     for eid, e in odds.groupby("event_id"):
         home, away = e.home.iloc[0], e.away.iloc[0]
         f = blended_fair(e, league, mf, model_weight)
-        mu_m, mu_t, mu_ml = f["mu_margin"], f["mu_total"], f["mu_ml"]
-        ref_age = e[e.book == f["ref_book"]].age_min.min() if f["ref_book"] is not None else np.nan
+        mu_m, mu_t, mu_ml, ref_age = f["mu_margin"], f["mu_total"], f["mu_ml"], f["ref_age"]
         for _, o in e.iterrows():
             if o.market == "spreads" and np.isfinite(mu_m):
                 home_line = o.line if o.side == "home" else -o.line
-                cp = cover_probs(mu_m, home_line, sd_s)
+                cp = _cover(dist, mu_m, home_line)
                 p_win = cp["win"] if o.side == "home" else cp["loss"]; p_push = cp["push"]
             elif o.market == "totals" and np.isfinite(mu_t):
                 tp = total_probs(mu_t, o.line, sd_t)
                 p_win, p_push = tp[o.side], tp["push"]
             elif o.market == "ml" and np.isfinite(mu_ml):
-                ph = 1 - norm.cdf(0, mu_ml, sd_s)
+                ph = _ml_prob(dist, mu_ml)
                 p_win, p_push = (ph if o.side == "home" else 1 - ph), 0.0
             else:
                 continue
             ek = edge_and_kelly(p_win, p_push, o.price, kelly_fraction, max_stake)
             rows.append(dict(commence=o.get("commence"), matchup=f"{away} @ {home}", market=o.market,
                              side=o.side, team=(home if o.side == "home" else away if o.side == "away" else o.side),
-                             line=o.line, price=o.price, book=o.book, ref_book=f["ref_book"],
+                             line=o.line, price=o.price, book=o.book, ref_book=f["ref_book"], ref_n=f["ref_n"],
                              fair_mu={"spreads": mu_m, "totals": mu_t, "ml": mu_ml}[o.market],
                              p_win=p_win, p_push=p_push, fair_price=_fair_american(p_win, p_push),
                              ev_pct=ek["ev"], kelly_stake=ek["stake_frac"],
@@ -488,8 +592,8 @@ def best_lines(odds: pd.DataFrame) -> pd.DataFrame:
 
 # ---------------- top picks ----------------
 PICK_COLS = ["rank", "commence", "matchup", "market", "player", "side", "team", "line", "price", "book", "also",
-             "n_books", "fair_price", "p_win", "ev_pct", "kelly_stake", "ref_book", "flags", "updated", "age_min",
-             "lag_min"]
+             "n_books", "fair_price", "p_win", "ev_pct", "kelly_stake", "ref_book", "ref_n", "flags", "updated",
+             "age_min", "lag_min"]
 
 
 def _am(p) -> str:

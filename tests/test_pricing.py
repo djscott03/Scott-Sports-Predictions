@@ -6,6 +6,7 @@ import pytest
 
 from sharpmodel.pricing import (american_to_prob, prob_to_american, decimal_from_american,
                                 devig, cover_probs, total_probs, moneyline_prob, edge_and_kelly)
+from sharpmodel.margins import cover_probs_emp
 from sharpmodel.odds import sharp_fair, find_ev, find_arbs, best_lines, load_odds_csv, parse_odds_json
 
 
@@ -64,9 +65,14 @@ def test_sharp_fair_inverts_symmetric_line_exactly():
         dict(event_id="e", home="PHI", away="DAL", book="pinnacle", market="totals", side="under", line=47.5, price=-110),
     ])
     f = sharp_fair(odds, "nfl")
-    assert f["ref_book"] == "pinnacle"
-    assert f["mu_margin"] == pytest.approx(7.0, abs=1e-6)
-    assert f["mu_total"] == pytest.approx(47.5, abs=1e-6)
+    assert f["ref_book"] == "pinnacle" and f["ref_n"] == 1
+    # NFL spreads invert on the key-number pmf: 'exactly' now means the mu whose P(cover -7 | no push) is 1/2. That
+    # is not 7.0 -- the fat 3 below 7 holds more mass than 8..10 above it, so the mean sits at ~8.3 -- but pricing
+    # the same -7 on the same pmf gives back a coin flip. The plain Normal (CFB) still lands on 7.0 exactly.
+    cp = cover_probs_emp(f["mu_margin"], -7.0)
+    assert cp["win"] == pytest.approx(cp["loss"], abs=1e-6) and 7.0 < f["mu_margin"] < 9.0
+    assert sharp_fair(odds, "cfb")["mu_margin"] == pytest.approx(7.0, abs=1e-6)
+    assert f["mu_total"] == pytest.approx(47.5, abs=1e-6)                         # totals stay Normal
 
 
 def test_find_ev_on_template_flags_stale_fanduel_total():

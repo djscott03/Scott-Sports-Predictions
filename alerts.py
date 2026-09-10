@@ -39,8 +39,17 @@ equivalent of 1 region" when the call names its books instead (the-odds-api.com 
 2026-09-06 ev-scan Action runs: 500 -> 491 -> 474 with the old us,us2,eu default = 9 a pull). alerts.py asks for
 the three markets (h2h, spreads, totals) at --books core = odds.CORE_BOOKS, ten books INCLUDING Pinnacle (the
 sharp anchor) plus the big US apps and two soft offshore books = 3 credits a run; --books wide (20) = 6. The
-cron in .github/workflows/alerts.yml is 16 runs/week x 3 = ~210 credits/month; the math lives in that file's
+cron in .github/workflows/alerts.yml is 17 runs/week x 3 = ~220 credits/month; the math lives in that file's
 header. The [alerts] line prints what the pull actually cost (x-requests-last) and 'credits left'.
+
+History and steam (sharpmodel/history.py): --history DIR appends every pull (the whole board, before the --hours
+window) to DIR/<league>/<YYYY-MM-DD>.parquet, so a paid-for pull is never thrown away; the Action keeps DIR on the
+`board` branch. --prev PATH_OR_URL is the previous run's board/odds_<league>.csv (the snapshot carries `pulled_at`);
+the sharp books' moves since then (history.moves: a spread by >= 1 point, a total by >= 1.5, a moneyline by >= 3%
+implied) go into the message as a 📈 STEAM block between the middles and the picks, at most --top-steam per run,
+keyed 'steam|matchup|market|book|to_line' (a moneyline keys on its price) so the same move is not repeated within
+the TTL while a further move is. A missing / 404 prev is the first run; any history failure prints
+'[alerts] history skipped: ...' and the alerts go out anyway.
 """
 from __future__ import annotations
 import argparse
@@ -52,6 +61,7 @@ import pandas as pd
 from sharpmodel.odds import (fetch_odds, load_odds_csv, within_hours, add_age, fresh, find_ev, top_picks,
                              NON_US_BOOKS, STALE_MIN, OddsAPIError, odds_credits, book_list)
 from sharpmodel.middles import find_middles, game_fairs
+from sharpmodel.history import append_snapshot, moves, steam_lines
 
 # Odds API book keys -> the names on the apps. Same table as app.py's BOOK_NAMES (kept separate on purpose:
 # app.py imports streamlit, and this script runs on a bare runner).
@@ -183,6 +193,13 @@ def middle_key(r: dict) -> str:
     return f"mid|{r['matchup']}|{r['bet_a']}|{r['bet_b']}"
 
 
+def steam_key(r: dict) -> str:
+    """'steam|DAL @ PHI|spreads|pinnacle|-3.5': the number the book moved TO (a moneyline: the price it moved to), so
+    the same move is not re-sent within the TTL while a further move is a new alert."""
+    to = _am(r["to_price"]) if str(r["market"]) == "ml" else _num(r.get("to_line"))
+    return "|".join(["steam", str(r["matchup"]), str(r["market"]), str(r["book"]), to])
+
+
 # ---------------- the scan ----------------
 def parse_exclude(s) -> list:
     """'nonus' -> odds.NON_US_BOOKS; 'a,b' -> ['a', 'b']; 'nonus,betus' -> both; '' -> []."""
@@ -214,9 +231,9 @@ def scan(odds: pd.DataFrame, league: str, min_ev: float = 2.0, min_middle_ev: fl
     return picks, mids
 
 
-def build_items(picks, mids, min_ev: float = 2.0, min_middle_ev: float = 1.0) -> list:
+def build_items(picks, mids, min_ev: float = 2.0, min_middle_ev: float = 1.0, steam=None) -> list:
     """Alertable rows -> [{kind, key, text}]: (a) pairs that cannot lose, (b) middles at >= min_middle_ev %,
-    (c) picks at >= min_ev % -- in that order."""
+    (c) the sharp books' moves (a history.moves frame, informational), (d) picks at >= min_ev % -- in that order."""
     locks, middles, plays = [], [], []
     if mids is not None and len(mids):
         for r in mids.to_dict("records"):
@@ -224,20 +241,23 @@ def build_items(picks, mids, min_ev: float = 2.0, min_middle_ev: float = 1.0) ->
                 locks.append(dict(kind="lock", key=middle_key(r), text=middle_line(r)))
             elif r["type"] in ("middle", "half_middle") and float(r["ev_pct"]) >= min_middle_ev:
                 middles.append(dict(kind="mid", key=middle_key(r), text=middle_line(r)))
+    moved = [dict(kind="steam", key=steam_key(r), text=t)
+             for r, t in zip(steam.to_dict("records"), steam_lines(steam, BOOK_NAMES))] if steam is not None and len(steam) else []
     if picks is not None and len(picks):
         for r in picks.to_dict("records"):
             if float(r["ev_pct"]) >= min_ev / 100 - EPS:
                 plays.append(dict(kind="pick", key=pick_key(r), text=pick_line(r)))
-    return locks + middles + plays
+    return locks + middles + moved + plays
 
 
-def new_items(items: list, state: dict, top: int) -> list:
-    """Items whose key is not in the state, the picks capped at `top` AFTER that check: a pick alerted this morning
-    never holds a slot against a new, weaker one this afternoon. Locks and middles are never capped. Picks past
-    the cap are not returned, so main() neither sends nor remembers them and they come next run."""
+def new_items(items: list, state: dict, top: int, top_steam: int = 5) -> list:
+    """Items whose key is not in the state, the picks capped at `top` and the steam at `top_steam` AFTER that check:
+    a pick alerted this morning never holds a slot against a new, weaker one this afternoon. Locks and middles are
+    never capped. Picks past the cap are not returned, so main() neither sends nor remembers them and they come
+    next run; moves past theirs are simply dropped (the next run compares against a newer snapshot)."""
     new = [i for i in items if i["key"] not in state]
-    picks = [i for i in new if i["kind"] == "pick"]
-    return [i for i in new if i["kind"] != "pick"] + picks[:max(int(top), 0)]
+    picks, steam = [i for i in new if i["kind"] == "pick"], [i for i in new if i["kind"] == "steam"]
+    return [i for i in new if i["kind"] not in ("pick", "steam")] + steam[:max(int(top_steam), 0)] + picks[:max(int(top), 0)]
 
 
 # ---------------- state ----------------
@@ -372,15 +392,22 @@ def parse_args(argv=None):
     p.add_argument("--snapshot", metavar="DIR",
                    help="also write the raw board to DIR/odds_<league>.csv + meta_<league>.json (the dashboard's "
                         "static snapshot: the Action publishes it so viewers never spend a credit)")
+    p.add_argument("--history", metavar="DIR",
+                   help="append every pull to DIR/<league>/<YYYY-MM-DD>.parquet (the Action keeps DIR on the board branch)")
+    p.add_argument("--prev", metavar="PATH_OR_URL",
+                   help="the previous run's board/odds_<league>.csv (a path or a raw.githubusercontent.com URL): the "
+                        "sharp books' moves since then are sent as a 📈 STEAM block; missing / 404 = first run, skipped")
+    p.add_argument("--top-steam", type=int, default=5, help="at most this many NEW sharp moves per run (5)")
     return p.parse_args(argv)
 
 
 def write_snapshot(odds: pd.DataFrame, league: str, folder: str, now, cost=None, books: str = "") -> str:
-    """The board as the dashboard reads it: every row (incl. `updated`), plus meta with the pull time (epoch) and
-    the credits picture. Written before the scan so a scan crash never loses a paid-for pull."""
+    """The board as the dashboard reads it: every row (incl. `updated`) plus `pulled_at` (epoch: the next run's --prev
+    reads it for the steam gap), and meta with the pull time and the credits picture. Written before the scan so a
+    scan crash never loses a paid-for pull."""
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f"odds_{league}.csv")
-    odds.to_csv(path, index=False)
+    odds.assign(pulled_at=float(_utc(now).timestamp())).to_csv(path, index=False)
     n_events, n_books = (odds.event_id.nunique(), odds.book.nunique()) if len(odds) else (0, 0)
     meta = dict(league=league, fetched_at=float(_utc(now).timestamp()), fetched_iso=_utc(now).isoformat(),
                 remaining=odds.attrs.get("remaining"), cost=cost, n_events=int(n_events), n_books=int(n_books),
@@ -388,6 +415,47 @@ def write_snapshot(odds: pd.DataFrame, league: str, folder: str, now, cost=None,
     with open(os.path.join(folder, f"meta_{league}.json"), "w") as f:
         json.dump(meta, f, indent=1)
     return path
+
+
+def load_prev(src: str):
+    """The previous board (--prev) as a frame, or None when there is none yet: a missing file, or a URL that 404s
+    (the board branch before its first publish). A URL is fetched with a 20 s timeout; any other failure raises a
+    RuntimeError naming the status / exception type only."""
+    if str(src).startswith(("http://", "https://")):
+        import requests
+        try:
+            r = requests.get(src, timeout=20)
+        except requests.RequestException as e:
+            raise RuntimeError(f"prev fetch failed: {type(e).__name__}") from None
+        if r.status_code == 404: return None
+        if not 200 <= r.status_code < 300: raise RuntimeError(f"prev fetch returned HTTP {r.status_code}")
+        from io import StringIO
+        return _with_event_id(pd.read_csv(StringIO(r.text)))
+    if not os.path.exists(src): return None
+    return _with_event_id(pd.read_csv(src))
+
+
+def _with_event_id(df: pd.DataFrame) -> pd.DataFrame:
+    """A hand-captured prev (lines_template.csv schema) has no event_id; synthesise it the way load_odds_csv does
+    for the current board so history.moves can match the games."""
+    if "event_id" not in df and {"home", "away"} <= set(df.columns):
+        df = df.assign(event_id=df.home.astype(str) + "@" + df.away.astype(str))
+    return df
+
+
+def sharp_moves(odds: pd.DataFrame, src: str, now):
+    """history.moves from the --prev snapshot to this pull (stamped `pulled_at` = now) for the sharp books, or None
+    with one '[alerts] history skipped: ...' line: no prev yet is the first run, anything else is printed and
+    ignored -- a steam problem never costs the alerts."""
+    try:
+        prev = load_prev(src)
+        if prev is None:
+            print(f"[alerts] history skipped: no previous snapshot at {src}")
+            return None
+        return moves(prev, odds.assign(pulled_at=float(_utc(now).timestamp())))
+    except Exception as e:
+        print(f"[alerts] history skipped: {type(e).__name__}: {e}")
+        return None
 
 
 def main(argv=None) -> int:
@@ -406,13 +474,21 @@ def main(argv=None) -> int:
     remaining = odds.attrs.get("remaining")                            # credits left, from the API headers (None: CSV)
     if a.snapshot:
         print(f"[alerts] snapshot -> {write_snapshot(odds, a.league, a.snapshot, now, cost, a.books)}")
+    if a.history:                                                       # the whole board, before the window: keep every pull
+        try:
+            print(f"[alerts] history -> {append_snapshot(odds, a.league, a.history, now)}")
+        except Exception as e:                                          # never costs the alerts (the pull is already paid for)
+            print(f"[alerts] history skipped: {type(e).__name__}: {e}")
     n_all, n_books = (odds.event_id.nunique(), odds.book.nunique()) if len(odds) else (0, 0)
     odds = within_hours(odds, a.hours)
     picks, mids = scan(odds, a.league, a.min_ev, a.min_middle_ev, a.max_age, excl)
-    items = build_items(picks, mids, a.min_ev, a.min_middle_ev)
+    mv = sharp_moves(odds, a.prev, now) if a.prev and not a.test and len(odds) else None
+    items = build_items(picks, mids, a.min_ev, a.min_middle_ev, mv)
     n_games = odds.event_id.nunique() if len(odds) else 0
     print(f"[alerts] {n_games} games within {a.hours:.0f}h (of {n_all}), {n_books} books, {len(mids)} arbs/middles on the "
-          f"board, {len(picks)} picks >= +{a.min_ev:g}% EV, {len(items)} alertable"
+          f"board, {len(picks)} picks >= +{a.min_ev:g}% EV"
+          + (f", {len(mv)} sharp moves since the last snapshot" if mv is not None else "")
+          + f", {len(items)} alertable"
           + (f" · this pull {cost} credits ({N_MARKETS} markets x {len(book_list(a.books) or [])} books '{a.books}')"
              if cost is not None else "")
           + (f", {remaining} credits left" if remaining is not None else ""))
@@ -423,8 +499,9 @@ def main(argv=None) -> int:
     else:
         state = load_state(a.state, now)
         unseen = [i for i in items if i["key"] not in state]
-        new = new_items(items, state, a.top)
-        known, held = len(items) - len(unseen), len(unseen) - len(new)   # already alerted / picks past --top (next run)
+        new = new_items(items, state, a.top, a.top_steam)
+        known = len(items) - len(unseen)                                                    # already alerted
+        held = sum(i["kind"] == "pick" for i in unseen) - sum(i["kind"] == "pick" for i in new)   # picks past --top (next run)
         text = compose(new, a.league, remaining, now) if new else ""
     if text:
         print(text)

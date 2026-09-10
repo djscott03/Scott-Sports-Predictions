@@ -24,7 +24,7 @@ def test_one_row_per_pick_best_price_first_and_also_column():
         _ev("CAR @ CHI", "spreads", "away", "CHI", -3.5, 110, "fanduel", 0.02),        # different number = different pick
     ])
     p = top_picks(ev, 10)
-    absent = ("player", "flags", "updated", "age_min", "lag_min")                        # not in this synthetic board
+    absent = ("player", "flags", "updated", "age_min", "lag_min", "ref_n")               # not in this synthetic board
     assert list(p.columns) == [c for c in PICK_COLS if c not in absent] and list(p["rank"]) == [1, 2, 3, 4]
     assert list(p.matchup) == ["ATL @ PIT", "CAR @ CHI", "DEN @ KC", "CAR @ CHI"]      # by EV
     chi = p.iloc[1]

@@ -34,20 +34,31 @@ sharpmodel/middles.py      cross-book arbs & middles: game_fairs (blended_fair -
 sharpmodel/props.py        nflverse weekly player stats -> project_players (EW usage x opp x env), fit_dispersion
                            (starters only), prop_probs / implied_mean (normal/poisson/bernoulli), price_props
                            (devigged consensus by normalised name, blend weight, rows carry event_id + dist + fair_sd)
+sharpmodel/history.py      line history + steam: append_snapshot(odds, league, folder, pulled_at) -> folder/<league>/
+                           <YYYY-MM-DD>.parquet (NY date; read + concat + rewrite, COLS = pulled_at epoch + the board
+                           columns), load_history(folder, league, days) -> one frame, moves(prev, curr, books=
+                           SHARP_BOOKS, min_spread=1, min_total=1.5, min_ml_prob=0.03) -> one row per event/book/
+                           market (home spread, over, home ML implied prob; delta positive = toward home / the over),
+                           steam_lines(mv, names) -> '📈 STEAM · DAL @ PHI · Pinnacle PHI -2.5 -> -3.5 (+1.0) in 62 min'
 run.py                     CLI: backtest | predict | ev (--csv --hours --exclude --weight/--nomodel; +EV table, then
                            ARBS & MIDDLES -> middles_*.csv) | props (--csv --markets --hours --credits --weight
                            --exclude --nomodel; board, then PROP ARBS & MIDDLES -> props_middles_*.csv);
                            --exclude takes book keys or 'nonus' (odds.NON_US_BOOKS)
 alerts.py                  CLI: alerts.py <league> [--csv] [--hours 240] [--min-ev 2.0] [--min-middle-ev 1.0]
-                           [--max-age 45] [--exclude nonus] [--state alerts_state.json] [--top 5] [--test] [--dry-run].
-                           One board pull -> scan (market-only, odds.fresh at --max-age) -> alertable items in order:
-                           guaranteed_pct >= 0 pairs (always), middles >= --min-middle-ev %, top picks >= --min-ev %
+                           [--max-age 45] [--exclude nonus] [--state alerts_state.json] [--top 5] [--test] [--dry-run]
+                           [--snapshot DIR] [--history DIR] [--prev PATH_OR_URL] [--top-steam 5].
+                           One board pull -> snapshot (odds_<league>.csv now carries pulled_at) + history.append_snapshot
+                           of the whole board -> scan (market-only, odds.fresh at --max-age) -> alertable items in
+                           order: guaranteed_pct >= 0 pairs (always), middles >= --min-middle-ev %, the sharp books'
+                           moves vs --prev (history.moves, informational, at most --top-steam), top picks >= --min-ev %
                            -> dedupe against the state JSON {key: first_seen_iso} (24 h TTL; key = pick|matchup|
-                           market|team|line|book|price or mid|bet_a|bet_b) -> Discord (DISCORD_WEBHOOK) / Telegram
-                           (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID), chunked at 1900 chars, friendly BOOK_NAMES
-                           (copied from app.py: never import app.py, it imports streamlit). Always prints the
-                           message and writes alerts_summary.md; state saved after delivery succeeds (a failed
-                           webhook exits 1 with the state untouched); --test sends the top pick and never writes.
+                           market|team|line|book|price, mid|bet_a|bet_b or steam|matchup|market|book|to_line) ->
+                           Discord (DISCORD_WEBHOOK) / Telegram (TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID), chunked at
+                           1900 chars, friendly BOOK_NAMES (copied from app.py: never import app.py, it imports
+                           streamlit). Always prints the message and writes alerts_summary.md; state saved after
+                           delivery succeeds (a failed webhook exits 1 with the state untouched); --test sends the
+                           top pick and never writes. A history / prev failure prints '[alerts] history skipped: ..'
+                           and never fails the run (a missing or 404 --prev is the first run).
 holdout.py                 fit blend weight on early seasons, confirm on held-out ones
 publish_card.py            auto-detect week -> predictions/<league>/<season>_wNN.{md,csv} + graded README index
 app.py                     Streamlit dashboard, Cleveland theme (.streamlit/config.toml + CSS block). Tabs: top picks
@@ -64,9 +75,10 @@ app.py                     Streamlit dashboard, Cleveland theme (.streamlit/conf
                            Sidebar Filters: min EV, window, markets, Teams, Books (pretty names -> extra exclusions),
                            raw exclude box. Never override font-family globally: Material icons become their names.
 lines_template.csv         --csv schema for game lines;  props_template.csv  --csv schema for props (both tracked)
-tests/                     offline pytest (110 tests, ~15s; incl. AppTest smoke + subprocess runs of run.py ev/props
+tests/                     offline pytest (136 tests, ~20s; incl. AppTest smoke + subprocess runs of run.py ev/props
                            and alerts.py --dry-run / --test; test_alerts.py also parses alerts.yml and counts its
-                           cron runs); conftest chdir's to repo root
+                           cron runs; test_history.py covers the day parquets, moves and steam text); conftest
+                           chdir's to repo root
 .github/workflows/ci.yml           pytest on push/PR (python 3.12)
 .github/workflows/weekly-card.yml  cron Tue+Thu 13:00 UTC + manual dispatch; commits predictions/
 .github/workflows/backtest.yml     manual dispatch; backtest -> job summary + csv artifact
@@ -77,11 +89,14 @@ tests/                     offline pytest (110 tests, ~15s; incl. AppTest smoke 
                                    Thu 23 / Mon 23 for TNF/MNF pregame, Tue-Sat 16 = 17 runs x 3 credits = 51/week,
                                    ~220/month; a window past midnight is a separate cron line because day-of-week
                                    flips at 00:00 UTC) + manual dispatch (league, test, min_ev, hours, books). Every
-                                   run: alerts.py --snapshot board -> orphan commit force-pushed to the `board`
-                                   branch (the dashboard's free snapshot; permissions contents: write; never main)
-                                   -> alerts to whichever channels have secrets; alerts_state.json rides
-                                   actions/cache (restore-keys prefix alerts-state-, save if: always()); summary
-                                   appended to the job summary; concurrency group
+                                   run: curl the previous board/odds_<league>.csv off the `board` branch (-> --prev)
+                                   + git archive its history/ -> alerts.py --snapshot board --history history --prev
+                                   prev_board.csv -> board/ + history/ committed ON TOP of the `board` branch (fetched,
+                                   plain push, commit only when changed, orphan only on the very first run; the
+                                   dashboard's free snapshot; permissions contents: write; never main) -> alerts to
+                                   whichever channels have secrets; alerts_state.json rides actions/cache
+                                   (restore-keys prefix alerts-state-, save if: always()); summary appended to the
+                                   job summary; concurrency group
 ```
 
 ## Key design decisions (don't undo these)
@@ -153,10 +168,22 @@ tests/                     offline pytest (110 tests, ~15s; incl. AppTest smoke 
 - In pandas use `df["flags"]`, never `df.flags` (built-in attribute shadows the column).
 - **The site is a snapshot; the cron is the spend.** `BOARD_SOURCE=snapshot` (default): app.py reads
   `BOARD_URL` (raw.githubusercontent.com/<repo>/board/board/odds_<league>.csv + meta_<league>.json),
-  which `alerts.py --snapshot board` writes and alerts.yml force-pushes as one orphan commit to the
-  `board` branch (never main: Streamlit Cloud would redeploy). Viewers never pull; the owner PIN's
-  "Pull fresh odds now" makes one budgeted live pull that wins while it is newer than the snapshot;
-  `BOARD_SOURCE=live` is the old per-viewer mode. 17 cron runs/week x 3 credits ≈ 220/month.
+  which `alerts.py --snapshot board` writes and alerts.yml commits to the `board` branch (never main:
+  Streamlit Cloud would redeploy). Viewers never pull; the owner PIN's "Pull fresh odds now" makes one
+  budgeted live pull that wins while it is newer than the snapshot; `BOARD_SOURCE=live` is the old
+  per-viewer mode. 17 cron runs/week x 3 credits ≈ 220/month.
+- **Every pull is kept; steam is read from the last two.** A pull is billed, so `alerts.py --history DIR`
+  appends the whole board to `DIR/<league>/<NY date>.parquet` (`history.append_snapshot`) and alerts.yml
+  keeps `history/` on the `board` branch: fetched first (`git archive board history`) so the day file is
+  appended to, then committed on top with a plain push -- the branch is no longer an orphan force-push, it
+  grows by one small parquet a day (~17 x 2.5k rows a week), fine for years. `--prev` (the previous
+  `board/odds_<league>.csv`, which carries `pulled_at`) feeds `history.moves` for `odds.SHARP_BOOKS`
+  regardless of `--exclude` (the sharps are excluded as bets, not as a signal), thresholds 1 pt / 1.5 pt /
+  3% implied, delta positive = toward home / the over (the margin convention), one move per event x book x
+  market; the 📈 STEAM block is informational, sits between the middles and the picks, is capped by
+  `--top-steam` after the dedupe and keyed on the number moved TO. Nothing in history may fail the alerts:
+  every failure is one '[alerts] history skipped: ...' line. `load_history` is the opening-line / CLV feed
+  (backlog item 5) -- never re-price the frozen card from it.
 - **Alerts are one 3-credit pull per run and dedupe by content, not by time.** `alerts.py` keys a pick on
   matchup|market|team|line|book|price and a middle on its two `bet_a|bet_b` strings (raw book keys), so
   a re-price is a new alert and the same number is never sent twice within 24 h; the state is saved

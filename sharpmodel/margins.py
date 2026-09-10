@@ -18,11 +18,14 @@ little when the spread *is* 3 but is far closer than the Normal.
 This module is OPT-IN. engine.py / pricing.py still price the weekly card off the plain
 Normal: switching them would re-price the frozen record in predictions/ and mix two
 distributions in one graded history. middles.py prices middles and half-point values
-off this pmf. Use weights=None for CFB and for totals (not fitted here).
+off this pmf, and odds.py (margin_dist) inverts and prices NFL spreads and moneylines on
+the +EV board with it: implied_margin_emp / implied_margin_ml_emp are the inverses of
+cover_probs_emp / moneyline_prob_emp. Use weights=None for CFB and for totals (not fitted here).
 """
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+from scipy.optimize import brentq
 from scipy.stats import norm
 
 NFL_GAMES_URL = "https://github.com/nflverse/nfldata/raw/master/data/games.csv"
@@ -116,3 +119,35 @@ def moneyline_prob_emp(mu: float, sd: float = NFL_SD,
                        weights: dict | None = NFL_KEY_WEIGHTS) -> float:
     """P(home wins outright) = P(margin > 0); ties are not a win."""
     return prob_between(margin_pmf(mu, sd, weights), 0, np.inf, (False, True))
+
+
+# ---------- inversions: a devigged price -> the mu that reproduces it ----------
+MU_BRACKET = (-60.0, 60.0)     # brentq bracket; a 60-point mean is 4.5 sd past any posted line
+
+
+def implied_margin_emp(line: float, p_cover: float, sd: float = NFL_SD,
+                       weights: dict | None = NFL_KEY_WEIGHTS) -> float:
+    """The inverse of cover_probs_emp: mu such that P(home covers | no push) == p_cover for home spread `line`
+    (negative = home favoured). p_cover is the devigged two-way cover probability, which already excludes pushes
+    (a push refunds both sides). brentq on MU_BRACKET; the ratio is strictly increasing in mu, so the root is
+    unique. weights=None inverts the discretized Normal. Round-trips cover_probs_emp to < 1e-6."""
+    if not _prob_ok(p_cover) or not np.isfinite(line): return float("nan")    # a blank price: unpriced, not a crash
+    def gap(mu):
+        cp = cover_probs_emp(mu, line, sd, weights)
+        return cp["win"] / (1 - cp["push"]) - p_cover
+    return float(brentq(gap, *MU_BRACKET, xtol=1e-10))
+
+
+def _prob_ok(p) -> bool:
+    """A devigged probability brentq can invert: finite and strictly inside (0, 1)."""
+    try: p = float(p)
+    except (TypeError, ValueError): return False
+    return np.isfinite(p) and 0.0 < p < 1.0
+
+
+def implied_margin_ml_emp(p_home: float, sd: float = NFL_SD,
+                          weights: dict | None = NFL_KEY_WEIGHTS) -> float:
+    """The inverse of moneyline_prob_emp: mu such that P(margin > 0) == p_home (the devigged home moneyline).
+    brentq on MU_BRACKET; round-trips moneyline_prob_emp to < 1e-6. NaN for a probability that cannot be inverted."""
+    if not _prob_ok(p_home): return float("nan")
+    return float(brentq(lambda mu: moneyline_prob_emp(mu, sd, weights) - p_home, *MU_BRACKET, xtol=1e-10))
