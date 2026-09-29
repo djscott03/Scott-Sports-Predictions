@@ -6,7 +6,8 @@ Each week is frozen at publish time (see `published_utc` in the CSV) and graded 
 |---|---|---|---|---|---|---|---|---|---|---|
 | 2026 | 1 | 16 | 16 | 1 | 1 | 0 | 0 | 0.89 | 11.6 | 11.41 |
 | 2026 | 2 | 16 | 16 |  |  |  |  |  | 11.6 | 11.56 |
-| 2026 | 3 | 16 | 0 |  |  |  |  |  |  |  |
+| 2026 | 3 | 16 | 16 |  |  |  |  |  | 8.26 | 8.38 |
+| 2026 | 4 | 16 | 0 |  |  |  |  |  |  |  |
 
 **Season to date — spreads:** 1-0-0, +0.89 u
 
@@ -14,3 +15,4 @@ Each week is frozen at publish time (see `published_utc` in the CSV) and graded 
 - [2026_w01](2026_w01.md)
 - [2026_w02](2026_w02.md)
 - [2026_w03](2026_w03.md)
+- [2026_w04](2026_w04.md)
