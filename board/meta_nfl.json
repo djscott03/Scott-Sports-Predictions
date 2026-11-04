@@ -1,11 +1,11 @@
 {
  "league": "nfl",
- "fetched_at": 1793740924.737386,
- "fetched_iso": "2026-11-03T21:22:04.737386+00:00",
- "remaining": 485,
+ "fetched_at": 1793828295.402414,
+ "fetched_iso": "2026-11-04T21:38:15.402414+00:00",
+ "remaining": 482,
  "cost": 3,
- "n_events": 29,
+ "n_events": 28,
  "n_books": 8,
  "books": "core",
- "rows": 880
+ "rows": 996
 }
